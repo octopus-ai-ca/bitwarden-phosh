@@ -14,7 +14,10 @@
     <ul>
       <li>Connexion à bitwarden.com, bitwarden.eu ou à un serveur auto-hébergé</li>
       <li>Connexion en deux étapes par application d'authentification ou par courriel</li>
-      <li>Recherche, copie sécurisée et codes TOTP</li>
+      <li>Coffre consultable hors ligne et session conservée entre les lancements</li>
+      <li>Déverrouillage par NIP</li>
+      <li>Création et modification d'identifiants et de notes sécurisées</li>
+      <li>Recherche, copie sécurisée, codes TOTP et générateur de mots de passe</li>
       <li>Verrouillage automatique après inactivité</li>
     </ul>
   </description>
@@ -32,9 +35,10 @@
     <control>pointing</control>
   </supports>
   <releases>
-    <release version="0.1.0" date="2026-09-29">
+    <release version="0.2.0" date="2026-09-29">
       <description>
-        <p>Premier jalon : connexion, synchronisation, consultation du coffre en lecture seule.</p>
+        <p>Première version publiée : connexion et 2FA, coffre hors ligne, session conservée,
+        déverrouillage par NIP, création et modification d'éléments.</p>
       </description>
     </release>
   </releases>

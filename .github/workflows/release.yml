@@ -1,0 +1,86 @@
+name: Publication
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  binaires:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dépendances système
+        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Archive
+        run: |
+          name=coffre-${GITHUB_REF_NAME}-linux-${{ matrix.arch }}
+          mkdir -p "$name"
+          cp target/release/coffre "$name/"
+          cp -r data LICENSE README.md install.sh "$name/"
+          tar czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaire-${{ matrix.arch }}
+          path: coffre-*.tar.gz*
+
+  flatpak:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-48
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: coffre-${{ matrix.arch }}.flatpak
+          manifest-path: build-aux/ca.octopusai.Coffre.json
+          arch: ${{ matrix.arch }}
+          cache-key: flatpak-builder-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
+
+  publier:
+    needs: [binaires, flatpak]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artefacts
+      - name: Notes de version
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          cat notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: Coffre ${{ github.ref_name }}
+          body_path: notes.md
+          files: |
+            artefacts/**/*.tar.gz
+            artefacts/**/*.sha256
+            artefacts/**/*.flatpak

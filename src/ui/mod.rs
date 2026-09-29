@@ -1,7 +1,8 @@
 //! Interface GTK4/libadwaita. Une seule fenêtre contenant un `AdwNavigationView` :
-//! connexion → (2FA) → coffre → détail, et une page de verrouillage.
+//! connexion → (2FA) → coffre → détail → modification, et une page de verrouillage.
 
 mod detail;
+mod edit;
 mod login;
 mod vault;
 
@@ -12,7 +13,7 @@ use std::time::{Duration, Instant};
 use adw::prelude::*;
 use gtk::{gio, glib};
 
-use crate::backend::Session;
+use crate::backend::{ItemDraft, ItemKind, Session};
 use crate::config::Config;
 
 /// Délai d'inactivité avant le verrouillage automatique.
@@ -72,8 +73,36 @@ impl App {
         }));
         this.setup_actions();
         this.setup_auto_lock();
-        this.show_login();
+        this.restore_session();
         this
+    }
+
+    /// Au démarrage : restaure la session précédente (verrouillée) ou affiche la connexion.
+    fn restore_session(&self) {
+        let loading = adw::StatusPage::builder()
+            .icon_name("dialog-password-symbolic")
+            .title("Coffre")
+            .build();
+        self.nav.replace(&[adw::NavigationPage::builder()
+            .title("Coffre")
+            .child(&loading)
+            .build()]);
+        let device_id = self.device_id();
+        let app = self.clone();
+        crate::spawn(
+            async move { Session::restore(&device_id).await },
+            move |result| match result {
+                Some(Ok(session)) => {
+                    app.set_session(Some(session));
+                    app.show_lock();
+                }
+                Some(Err(e)) => {
+                    app.toast(&e.to_string());
+                    app.show_login();
+                }
+                None => app.show_login(),
+            },
+        );
     }
 
     pub fn present(&self) {
@@ -111,6 +140,29 @@ impl App {
                 .present(Some(&app.window));
         });
         self.window.add_action(&about);
+
+        let new_item = gio::SimpleAction::new("new-item", None);
+        let app = self.clone();
+        new_item.connect_activate(move |_, _| {
+            app.show_editor(None, ItemKind::Login, ItemDraft::default())
+        });
+        self.window.add_action(&new_item);
+
+        let set_pin = gio::SimpleAction::new("set-pin", None);
+        let app = self.clone();
+        set_pin.connect_activate(move |_, _| login::set_pin_dialog(&app));
+        self.window.add_action(&set_pin);
+
+        let clear_pin = gio::SimpleAction::new("clear-pin", None);
+        let app = self.clone();
+        clear_pin.connect_activate(move |_, _| {
+            if let Some(session) = app.session() {
+                session.clear_pin();
+                app.toast("NIP retiré");
+                app.show_vault();
+            }
+        });
+        self.window.add_action(&clear_pin);
     }
 
     /// Verrouille après `AUTO_LOCK_AFTER` sans interaction (tactile ou clavier).
@@ -186,6 +238,11 @@ impl App {
         self.nav.replace(&[login::lock_page(self)]);
     }
 
+    /// Page de modification (`id` fourni) ou de création (`id` absent).
+    pub fn show_editor(&self, id: Option<String>, kind: ItemKind, draft: ItemDraft) {
+        self.nav.push(&edit::edit_page(self, id, kind, draft));
+    }
+
     pub fn show_detail(&self, id: String) {
         let Some(session) = self.session() else {
             return;
@@ -249,17 +306,25 @@ impl App {
         }
     }
 
-    fn unlock(&self, password: String, done: impl FnOnce(bool) + 'static) {
+    /// Déverrouille avec le mot de passe maître (`pin == false`) ou le NIP.
+    fn unlock(&self, secret: String, pin: bool, done: impl FnOnce(bool) + 'static) {
         let Some(session) = self.session() else {
             return;
         };
         let app = self.clone();
         crate::spawn(
-            async move { session.unlock(password).await },
+            async move {
+                if pin {
+                    session.unlock_with_pin(secret).await
+                } else {
+                    session.unlock(secret).await
+                }
+            },
             move |result| match result {
                 Ok(()) => {
                     app.touch_activity();
                     app.show_vault();
+                    app.sync_quietly();
                     done(true);
                 }
                 Err(e) => {
@@ -294,9 +359,97 @@ impl App {
         );
     }
 
+    /// Synchronisation en arrière-plan après un déverrouillage; le coffre local
+    /// reste utilisable hors ligne en cas d'échec.
+    fn sync_quietly(&self) {
+        let Some(mut session) = self.session() else {
+            return;
+        };
+        let app = self.clone();
+        crate::spawn(
+            async move {
+                session.sync().await?;
+                Ok::<_, crate::backend::Error>(session)
+            },
+            move |result| match result {
+                Ok(session) => {
+                    let on_vault = app
+                        .nav
+                        .visible_page()
+                        .and_then(|p| p.tag())
+                        .is_some_and(|t| t == "vault");
+                    app.set_session(Some(session));
+                    if on_vault {
+                        app.show_vault();
+                    }
+                }
+                Err(crate::backend::Error::SessionExpired) => {
+                    app.toast("Session expirée : déconnectez-vous puis reconnectez-vous pour synchroniser.");
+                }
+                Err(e) => eprintln!("synchronisation en arrière-plan : {e}"),
+            },
+        );
+    }
+
+    /// Enregistre un élément (création si `id` est absent), puis revient au coffre.
+    fn save_item(
+        &self,
+        id: Option<String>,
+        kind: ItemKind,
+        draft: ItemDraft,
+        done: impl FnOnce(bool) + 'static,
+    ) {
+        let Some(mut session) = self.session() else {
+            return;
+        };
+        let app = self.clone();
+        crate::spawn(
+            async move {
+                match id {
+                    Some(id) => session.edit_item(&id, draft).await?,
+                    None => session.create_item(kind, draft).await?,
+                }
+                Ok::<_, crate::backend::Error>(session)
+            },
+            move |result| match result {
+                Ok(session) => {
+                    app.set_session(Some(session));
+                    app.show_vault();
+                    app.toast("Élément enregistré");
+                    done(true);
+                }
+                Err(e) => {
+                    app.toast(&e.to_string());
+                    done(false);
+                }
+            },
+        );
+    }
+
+    /// Envoie un élément à la corbeille, puis revient au coffre.
+    fn trash_item(&self, id: String) {
+        let Some(session) = self.session() else {
+            return;
+        };
+        let app = self.clone();
+        crate::spawn(
+            async move { session.trash(&id).await },
+            move |result| match result {
+                Ok(()) => {
+                    app.show_vault();
+                    app.toast("Élément envoyé à la corbeille");
+                }
+                Err(e) => app.toast(&e.to_string()),
+            },
+        );
+    }
+
+    /// Déconnexion : efface les clés, le NIP et toutes les données locales.
     pub fn logout(&self) {
         if let Some(session) = self.state.borrow_mut().session.take() {
-            session.lock();
+            session.logout();
+        } else {
+            crate::backend::wipe_local_data();
         }
         self.show_login();
     }

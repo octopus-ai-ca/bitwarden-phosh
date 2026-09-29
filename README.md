@@ -27,25 +27,47 @@ seule) ne sont pas utilisées. Le SDK n'étant pas publié sur crates.io, il est
 
 ### Sécurité
 
-- Seules des données **chiffrées** (éléments, clés protégées) restent en mémoire après la
-  synchro ; les clés déchiffrées vivent dans le `KeyStore` du SDK.
-- Verrouillage automatique après 5 minutes d'inactivité (efface les clés) ; le
-  déverrouillage se fait localement, sans réseau.
+- Les éléments du coffre sont stockés **chiffrés** dans la base SQLite du SDK
+  (`~/.local/share/coffre/vault.sqlite`, dossier en droits 0700) ; les clés déchiffrées
+  ne vivent qu'en mémoire, dans le `KeyStore` du SDK.
+- Cette base contient aussi les jetons d'accès et de rafraîchissement (comme le CLI
+  officiel) : ils permettent de synchroniser, mais pas de déchiffrer le coffre sans le
+  mot de passe maître.
+- Verrouillage automatique après 5 minutes d'inactivité ; au redémarrage, l'application
+  s'ouvre verrouillée et se déverrouille localement, sans réseau.
+- Le NIP n'est gardé qu'en mémoire (oublié à la fermeture) et désactivé après 5 essais
+  infructueux, comme l'option par défaut des clients officiels.
 - Le presse-papier est vidé 30 secondes après une copie.
-- Rien de sensible n'est écrit sur disque : `~/.config/coffre/config.json` ne contient que le
-  serveur, le courriel et l'identifiant d'appareil.
+- La déconnexion efface toutes les données locales.
 
-## Premier jalon (v0.1)
+## Fonctionnalités (v0.2)
 
 - [x] Connexion par mot de passe maître (bitwarden.com, .eu, auto-hébergé)
 - [x] 2FA : application d'authentification ou courriel
-- [x] Synchronisation et liste du coffre (recherche)
-- [x] Détail : identifiant, mot de passe, TOTP, sites, carte, champs, notes
+- [x] Session conservée et coffre consultable hors ligne
+- [x] Déverrouillage par NIP
+- [x] Liste, recherche et détail (identifiant, mot de passe, TOTP, sites, carte, champs, notes)
+- [x] Création et modification d'identifiants et de notes sécurisées
+- [x] Générateur de mots de passe, historique des mots de passe, corbeille
 - [x] Copie avec effacement automatique du presse-papier
 - [x] Verrouillage automatique et manuel
 
-Limites connues : la session n'est pas conservée entre les lancements (connexion, et 2FA,
-à chaque démarrage) ; consultation en lecture seule ; pas de SSO, WebAuthn, YubiKey ni Duo.
+Limites connues : pas de SSO, WebAuthn, YubiKey ni Duo ; l'option « se souvenir de cet
+appareil » de la 2FA n'est pas exposée par le SDK (la 2FA n'est toutefois demandée qu'à
+la première connexion) ; seuls les identifiants et les notes sécurisées sont modifiables ;
+pas de pièces jointes ni de dossiers.
+
+## Installation
+
+Depuis la [page des publications](https://github.com/octopus-ai-ca/bitwarden-phosh/releases) :
+
+```sh
+# Flatpak (recommandé ; remplacer aarch64 par x86_64 selon l'appareil)
+flatpak install --user coffre-aarch64.flatpak
+
+# ou archive binaire (requiert GTK 4.14+ et libadwaita 1.5+)
+tar xzf coffre-v0.2.0-linux-aarch64.tar.gz && ./coffre-v0.2.0-linux-aarch64/install.sh
+```
 
 ## Compilation
 
@@ -61,6 +83,8 @@ Rust 1.88 ou plus récent est requis (exigence du SDK).
 cargo run            # développement
 cargo test           # tests unitaires
 cargo test -- --ignored   # test réseau réel contre bitwarden.com
+# parcours complet contre un Vaultwarden local :
+COFFRE_E2E_SERVER=http://127.0.0.1:8000 cargo test e2e -- --ignored
 ```
 
 ### Flatpak (x86_64 et aarch64)
@@ -90,9 +114,11 @@ src/
 ├── config.rs      Préférences non sensibles
 └── ui/
     ├── mod.rs     Fenêtre, navigation, verrouillage auto, presse-papier
-    ├── login.rs   Connexion, 2FA, déverrouillage
+    ├── login.rs   Connexion, 2FA, déverrouillage (mot de passe ou NIP)
     ├── vault.rs   Liste et recherche
-    └── detail.rs  Détail d'un élément
+    ├── detail.rs  Détail d'un élément
+    └── edit.rs    Création et modification
 data/              .desktop, metainfo, icône
 build-aux/         Manifeste Flatpak et sources Cargo
+.github/workflows/ CI et publication (binaires + Flatpak, x86_64 et aarch64)
 ```

@@ -10,9 +10,17 @@ pub fn vault_page(app: &App) -> adw::NavigationPage {
 
     let sync_button = icon_button("view-refresh-symbolic", "Synchroniser");
     header.pack_start(&sync_button);
+    let add_button = icon_button("list-add-symbolic", "Nouvel élément");
+    add_button.set_action_name(Some("win.new-item"));
+    header.pack_start(&add_button);
 
     let menu = gtk::gio::Menu::new();
     menu.append(Some("Verrouiller"), Some("win.lock"));
+    if app.session().is_some_and(|s| s.has_pin()) {
+        menu.append(Some("Retirer le NIP"), Some("win.clear-pin"));
+    } else {
+        menu.append(Some("Définir un NIP…"), Some("win.set-pin"));
+    }
     menu.append(Some("Se déconnecter"), Some("win.logout"));
     menu.append(Some("À propos de Coffre"), Some("win.about"));
     header.pack_end(
@@ -22,9 +30,6 @@ pub fn vault_page(app: &App) -> adw::NavigationPage {
             .menu_model(&menu)
             .build(),
     );
-    let lock_button = icon_button("system-lock-screen-symbolic", "Verrouiller");
-    lock_button.set_action_name(Some("win.lock"));
-    header.pack_end(&lock_button);
 
     let search_button = gtk::ToggleButton::builder()
         .icon_name("system-search-symbolic")
@@ -107,10 +112,18 @@ pub fn vault_page(app: &App) -> adw::NavigationPage {
     // Chargement asynchrone de la liste déchiffrée.
     if let Some(session) = app.session() {
         let app = app.clone();
-        crate::spawn(async move { session.list().await }, move |items| {
+        crate::spawn(async move { session.list().await }, move |result| {
+            let items = match result {
+                Ok(items) => items,
+                Err(e) => {
+                    empty.set_title("Erreur");
+                    empty.set_description(Some(&gtk::glib::markup_escape_text(&e.to_string())));
+                    return;
+                }
+            };
             if items.is_empty() {
                 empty.set_title("Coffre vide");
-                empty.set_description(Some("Aucun élément à afficher."));
+                empty.set_description(Some("Touchez + pour ajouter un premier élément."));
                 return;
             }
             let mut rows = rows.borrow_mut();

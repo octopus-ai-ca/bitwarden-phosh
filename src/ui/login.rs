@@ -78,19 +78,19 @@ pub fn login_page(app: &App, config: &Config) -> adw::NavigationPage {
             app_.toast("Entrez votre courriel et votre mot de passe maître.");
             return;
         }
-        let session = match Session::new(&server, &app_.device_id(), &email) {
-            Ok(session) => session,
-            Err(e) => return app_.toast(&e.to_string()),
-        };
-        app_.remember_account(server, email);
+        app_.remember_account(server.clone(), email.clone());
         set_busy(button, true, "Se connecter", "Connexion…");
-        login(
-            &app_,
-            session,
-            password,
-            None,
-            button.clone(),
-            "Se connecter",
+        let device_id = app_.device_id();
+        let (app, button) = (app_.clone(), button.clone());
+        crate::spawn(
+            async move { Session::create(&server, &device_id, &email).await },
+            move |result| match result {
+                Ok(session) => login(&app, session, password, None, button, "Se connecter"),
+                Err(e) => {
+                    set_busy(&button, false, "Se connecter", "");
+                    app.toast(&e.to_string());
+                }
+            },
         );
     });
     let button_ = button.clone();
@@ -264,10 +264,16 @@ pub fn two_factor_page(
 }
 
 pub fn lock_page(app: &App) -> adw::NavigationPage {
-    let email = app
-        .session()
+    let session = app.session();
+    let email = session
+        .as_ref()
         .map(|s| s.email().to_owned())
         .unwrap_or_default();
+    // Le NIP (en mémoire seulement) est proposé en premier s'il est défini.
+    let use_pin = std::rc::Rc::new(std::cell::Cell::new(
+        session.as_ref().is_some_and(Session::has_pin),
+    ));
+
     let status = adw::StatusPage::builder()
         .icon_name("system-lock-screen-symbolic")
         .title("Coffre verrouillé")
@@ -275,13 +281,16 @@ pub fn lock_page(app: &App) -> adw::NavigationPage {
         .build();
     status.add_css_class("compact");
 
-    let password_row = adw::PasswordEntryRow::builder()
-        .title("Mot de passe maître")
-        .build();
+    let secret_row = adw::PasswordEntryRow::new();
     let group = adw::PreferencesGroup::new();
-    group.add(&password_row);
+    group.add(&secret_row);
 
     let button = pill_button("Déverrouiller");
+    let switch = gtk::Button::builder()
+        .halign(gtk::Align::Center)
+        .visible(use_pin.get())
+        .build();
+    switch.add_css_class("flat");
     let logout = gtk::Button::builder()
         .label("Se déconnecter")
         .halign(gtk::Align::Center)
@@ -289,37 +298,126 @@ pub fn lock_page(app: &App) -> adw::NavigationPage {
         .build();
     logout.add_css_class("flat");
 
+    let apply_mode = {
+        let (row, switch) = (secret_row.clone(), switch.clone());
+        move |pin: bool| {
+            row.set_text("");
+            if pin {
+                row.set_title("NIP");
+                row.set_input_purpose(gtk::InputPurpose::Pin);
+                switch.set_label("Utiliser le mot de passe maître");
+            } else {
+                row.set_title("Mot de passe maître");
+                row.set_input_purpose(gtk::InputPurpose::Password);
+                switch.set_label("Utiliser le NIP");
+            }
+        }
+    };
+    apply_mode(use_pin.get());
+    {
+        let (use_pin, apply_mode, row) = (use_pin.clone(), apply_mode.clone(), secret_row.clone());
+        switch.connect_clicked(move |_| {
+            use_pin.set(!use_pin.get());
+            apply_mode(use_pin.get());
+            row.grab_focus();
+        });
+    }
+
     let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
     content.append(&status);
     content.append(&group);
     content.append(&button);
+    content.append(&switch);
     content.append(&logout);
 
     let app_ = app.clone();
-    let password = password_row.clone();
+    let row = secret_row.clone();
     button.connect_clicked(move |button| {
-        let value = password.text().to_string();
+        let value = row.text().to_string();
         if value.is_empty() {
             return;
         }
         set_busy(button, true, "Déverrouiller", "Déverrouillage…");
-        let (button, password) = (button.clone(), password.clone());
-        app_.unlock(value, move |ok| {
+        let (app, button, row, pin) = (app_.clone(), button.clone(), row.clone(), use_pin.get());
+        app_.unlock(value, pin, move |ok| {
             set_busy(&button, false, "Déverrouiller", "");
-            if !ok {
-                password.set_text("");
-                password.grab_focus();
+            if ok {
+                return;
             }
+            // Trop d'essais : le NIP a été oublié, on repasse au mot de passe maître.
+            if pin && !app.session().is_some_and(|s| s.has_pin()) {
+                app.show_lock();
+                return;
+            }
+            row.set_text("");
+            row.grab_focus();
         });
     });
     let button_ = button.clone();
-    password_row.connect_entry_activated(move |_| button_.emit_clicked());
+    secret_row.connect_entry_activated(move |_| button_.emit_clicked());
 
     let page = page("Verrouillé", "lock", &adw::HeaderBar::new(), &content);
     page.connect_shown(move |_| {
-        password_row.grab_focus();
+        secret_row.grab_focus();
     });
     page
+}
+
+/// Dialogue de définition du NIP (4 à 12 chiffres, saisi deux fois).
+pub fn set_pin_dialog(app: &App) {
+    let Some(session) = app.session() else {
+        return;
+    };
+    let pin_row = adw::PasswordEntryRow::builder()
+        .title("NIP")
+        .input_purpose(gtk::InputPurpose::Pin)
+        .build();
+    let confirm_row = adw::PasswordEntryRow::builder()
+        .title("Confirmer le NIP")
+        .input_purpose(gtk::InputPurpose::Pin)
+        .build();
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .build();
+    list.add_css_class("boxed-list");
+    list.append(&pin_row);
+    list.append(&confirm_row);
+
+    let dialog = adw::AlertDialog::builder()
+        .heading("Définir un NIP")
+        .body(format!(
+            "Le NIP permet de déverrouiller rapidement le coffre. Il est oublié à la fermeture \
+             de l'application et désactivé après {} essais infructueux.",
+            crate::backend::PIN_ATTEMPTS
+        ))
+        .extra_child(&list)
+        .default_response("save")
+        .close_response("cancel")
+        .build();
+    dialog.add_response("cancel", "Annuler");
+    dialog.add_response("save", "Enregistrer");
+    dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+
+    let app_ = app.clone();
+    dialog.connect_response(Some("save"), move |_, _| {
+        let pin = pin_row.text().to_string();
+        if pin.len() < 4 || pin.len() > 12 || !pin.chars().all(|c| c.is_ascii_digit()) {
+            app_.toast("Le NIP doit compter de 4 à 12 chiffres.");
+            return;
+        }
+        if pin != confirm_row.text().as_str() {
+            app_.toast("Les deux NIP ne correspondent pas.");
+            return;
+        }
+        match session.set_pin(pin) {
+            Ok(()) => {
+                app_.toast("NIP défini");
+                app_.show_vault();
+            }
+            Err(e) => app_.toast(&e.to_string()),
+        }
+    });
+    dialog.present(Some(&app.window));
 }
 
 fn about_menu() -> gtk::MenuButton {

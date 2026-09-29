@@ -1,27 +1,53 @@
 //! Couche d'accès au coffre, bâtie sur le SDK officiel Bitwarden (option GPL-3.0).
 //!
-//! Le SDK se charge de l'authentification, de la dérivation de clés et du
-//! déchiffrement. Ce module ne conserve en mémoire que des données chiffrées
-//! (éléments du coffre, clés protégées); les clés déchiffrées vivent dans le
-//! `KeyStore` du SDK et sont effacées au verrouillage.
+//! Le SDK se charge de l'authentification, de la dérivation de clés, du
+//! déchiffrement et de la persistance (base SQLite : jetons d'accès et éléments
+//! **chiffrés**). Les clés déchiffrées ne vivent que dans le `KeyStore` du SDK
+//! et sont effacées au verrouillage.
+//!
+//! Fichiers, dans `$XDG_DATA_HOME/coffre/` (droits 0700) :
+//! - `vault.sqlite` : état du SDK (jetons, éléments chiffrés);
+//! - `account.json` : serveur, courriel et clés *protégées* nécessaires au
+//!   déverrouillage hors ligne.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use bitwarden_auth::token_management::PasswordManagerTokenHandler;
 use bitwarden_core::{
-    Client, ClientBuilder, ClientSettings, DeviceType, OrganizationId,
+    Client, ClientBuilder, ClientSettings, DeviceType, OrganizationId, UserId,
     auth::login::{
         PasswordLoginRequest, TwoFactorEmailRequest, TwoFactorProvider, TwoFactorRequest,
     },
+    client::persisted_state::OrganizationSharedKey,
     key_management::{
-        MasterPasswordUnlockData, SymmetricKeySlotId,
+        LocalUserDataKeyState, MasterPasswordUnlockData, SymmetricKeySlotId,
         account_cryptographic_state::WrappedAccountCryptographicState,
         crypto::{InitOrgCryptoRequest, InitUserCryptoMethod, InitUserCryptoRequest},
     },
 };
-use bitwarden_crypto::{EncString, Kdf, UnsignedSharedKey};
-use bitwarden_vault::{Cipher, CipherListView, CipherView, VaultClientExt};
+use bitwarden_crypto::{EncString, Kdf, UnsignedSharedKey, safe::PasswordProtectedKeyEnvelope};
+use bitwarden_generators::{GeneratorClientsExt, PasswordGeneratorRequest};
+use bitwarden_state::{
+    DatabaseConfiguration, SettingItem,
+    registry::StateRegistry,
+    repository::{RepositoryItem, RepositoryMigrationStep, RepositoryMigrations},
+};
+use bitwarden_vault::{
+    Cipher, CipherId, CipherListView, CipherRepromptType, CipherType, CipherView, Folder,
+    LoginUriView, LoginView, PasswordHistoryView, SecureNoteType, SecureNoteView, VaultClientExt,
+};
+
+/// Version des clients officiels dont le SDK utilisé reproduit le comportement ;
+/// envoyée dans l'en-tête `Bitwarden-Client-Version`, que les serveurs (dont
+/// Vaultwarden) consultent pour activer les fonctions récentes.
+const COMPAT_CLIENT_VERSION: &str = "2026.9.0";
+
+/// Nombre d'essais de NIP avant d'exiger le mot de passe maître.
+pub const PIN_ATTEMPTS: u8 = 5;
+/// Nombre d'anciens mots de passe conservés (comme les clients officiels).
+const PASSWORD_HISTORY_LEN: usize = 5;
 
 /// Serveur Bitwarden visé.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, PartialEq, Eq)]
@@ -66,22 +92,59 @@ pub enum Error {
     InvalidServerUrl,
     #[error("Mot de passe maître incorrect.")]
     WrongPassword,
+    #[error("Courriel ou mot de passe maître incorrect.")]
+    BadCredentials,
+    #[error("Code de vérification invalide.")]
+    BadTwoFactorCode,
+    #[error("NIP incorrect ({0} essai(s) restant(s)).")]
+    WrongPin(u8),
+    #[error("Trop d'essais : le NIP est désactivé, utilisez le mot de passe maître.")]
+    PinDisabled,
     #[error("Cette méthode de connexion en deux étapes n'est pas encore prise en charge.")]
     UnsupportedTwoFactor,
+    #[error("Session expirée : reconnectez-vous pour synchroniser.")]
+    SessionExpired,
     #[error("Réponse du serveur incomplète : {0}")]
     MissingData(&'static str),
     #[error("Élément introuvable.")]
     ItemNotFound,
+    #[error("Le nom de l'élément est obligatoire.")]
+    EmptyName,
+    #[error("Vous n'avez pas le droit de modifier cet élément.")]
+    ReadOnly,
     #[error("Échec de la connexion : {0}")]
-    Login(#[from] bitwarden_core::auth::login::LoginError),
+    Login(String),
     #[error("Échec de l'envoi du courriel : {0}")]
     TwoFactorEmail(#[from] bitwarden_core::auth::login::TwoFactorEmailError),
-    #[error("Échec de la synchronisation : {0}")]
+    #[error("Erreur réseau : {0}")]
     Api(String),
     #[error("Erreur de chiffrement : {0}")]
     Crypto(String),
+    #[error("Erreur de stockage : {0}")]
+    Storage(String),
     #[error("Erreur de déchiffrement : {0}")]
     Decrypt(#[from] bitwarden_vault::DecryptError),
+}
+
+impl From<bitwarden_core::auth::login::LoginError> for Error {
+    fn from(e: bitwarden_core::auth::login::LoginError) -> Self {
+        let message = e.to_string();
+        // Messages renvoyés tels quels par bitwarden.com et Vaultwarden.
+        if message.contains("Username or password is incorrect") {
+            Self::BadCredentials
+        } else if message.contains("Two-step token is invalid")
+            || message.contains("Invalid TOTP code")
+            || message.contains("TOTP code is not a number")
+        {
+            Self::BadTwoFactorCode
+        } else {
+            Self::Login(message)
+        }
+    }
+}
+
+fn storage<E: std::fmt::Display>(e: E) -> Error {
+    Error::Storage(e.to_string())
 }
 
 /// Méthodes 2FA proposées par le serveur et prises en charge ici.
@@ -103,48 +166,224 @@ pub enum TwoFactorMethod {
     Email,
 }
 
-/// Données chiffrées nécessaires pour déverrouiller sans repasser par le serveur.
-#[derive(Clone)]
-struct UnlockData {
+/// Type d'élément que l'on peut créer depuis l'application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemKind {
+    Login,
+    SecureNote,
+}
+
+/// Contenu éditable d'un élément (identifiant ou note sécurisée).
+#[derive(Debug, Clone, Default)]
+pub struct ItemDraft {
+    pub name: String,
+    pub username: String,
+    pub password: String,
+    pub uri: String,
+    pub totp: String,
+    pub notes: String,
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+impl ItemDraft {
+    pub fn from_view(view: &CipherView) -> Self {
+        let login = view.login.as_ref();
+        Self {
+            name: view.name.clone(),
+            username: login.and_then(|l| l.username.clone()).unwrap_or_default(),
+            password: login.and_then(|l| l.password.clone()).unwrap_or_default(),
+            uri: login
+                .and_then(|l| l.uris.as_ref())
+                .and_then(|u| u.first())
+                .and_then(|u| u.uri.clone())
+                .unwrap_or_default(),
+            totp: login.and_then(|l| l.totp.clone()).unwrap_or_default(),
+            notes: view.notes.clone().unwrap_or_default(),
+        }
+    }
+
+    /// Applique le brouillon à une vue d'identifiant existante (ou vide) en
+    /// conservant les champs que l'application ne sait pas modifier.
+    fn apply_login(&self, mut login: LoginView) -> LoginView {
+        // Le mot de passe (non rogné) est conservé tel que saisi.
+        let password = (!self.password.is_empty()).then(|| self.password.clone());
+        login.username = non_empty(&self.username);
+        login.password = password;
+        login.totp = non_empty(&self.totp);
+        let mut uris = login.uris.take().unwrap_or_default();
+        match non_empty(&self.uri) {
+            Some(uri) => match uris.first_mut() {
+                Some(first) if first.uri.as_deref() != Some(uri.as_str()) => {
+                    first.uri = Some(uri);
+                    first.uri_checksum = None;
+                }
+                Some(_) => {}
+                None => uris.push(LoginUriView {
+                    uri: Some(uri),
+                    r#match: None,
+                    uri_checksum: None,
+                }),
+            },
+            None => {
+                if !uris.is_empty() {
+                    uris.remove(0);
+                }
+            }
+        }
+        login.uris = (!uris.is_empty()).then_some(uris);
+        login.generate_checksums();
+        login
+    }
+}
+
+fn empty_login() -> LoginView {
+    LoginView {
+        username: None,
+        password: None,
+        password_revision_date: None,
+        uris: None,
+        totp: None,
+        autofill_on_page_load: None,
+        fido2_credentials: None,
+    }
+}
+
+/// Données persistées (aucun secret en clair) pour restaurer la session et
+/// déverrouiller hors ligne.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct Account {
+    server: Server,
+    email: String,
+    user_id: Option<UserId>,
     kdf: Kdf,
     master_password_unlock: MasterPasswordUnlockData,
-    account_state: String,
+    account_state: WrappedAccountCryptographicState,
     org_keys: HashMap<OrganizationId, UnsignedSharedKey>,
 }
 
-/// Session d'un compte : client SDK, éléments chiffrés et données de déverrouillage.
-///
-/// `Clone` partage le même client SDK (Arc interne).
+struct PinState {
+    envelope: PasswordProtectedKeyEnvelope,
+    attempts_left: u8,
+}
+
+fn data_dir() -> PathBuf {
+    gtk::glib::user_data_dir().join(crate::APP_NAME)
+}
+
+fn account_path() -> PathBuf {
+    data_dir().join("account.json")
+}
+
+fn migrations() -> RepositoryMigrations {
+    use RepositoryMigrationStep::Add;
+    RepositoryMigrations::new(vec![
+        Add(Cipher::data()),
+        Add(Folder::data()),
+        Add(SettingItem::data()),
+        Add(OrganizationSharedKey::data()),
+        Add(LocalUserDataKeyState::data()),
+    ])
+}
+
+fn ensure_data_dir() -> Result<PathBuf, Error> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = data_dir();
+    std::fs::create_dir_all(&dir).map_err(storage)?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(storage)?;
+    Ok(dir)
+}
+
+/// Limite au propriétaire les fichiers créés par SQLite (base, journal).
+fn restrict_permissions(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let _ = std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+/// Supprime toutes les données locales (déconnexion ou nouveau compte).
+pub fn wipe_local_data() {
+    let dir = data_dir();
+    if dir.exists()
+        && let Err(e) = std::fs::remove_dir_all(&dir)
+    {
+        eprintln!("impossible de supprimer {}: {e}", dir.display());
+    }
+}
+
+/// Session d'un compte. `Clone` partage le même client SDK (Arc interne).
 #[derive(Clone)]
 pub struct Session {
     client: Client,
+    server: Server,
     email: String,
-    unlock: Option<Arc<UnlockData>>,
-    ciphers: Arc<Vec<Cipher>>,
+    account: Option<Arc<Account>>,
+    pin: Arc<Mutex<Option<PinState>>>,
 }
 
 impl Session {
-    pub fn new(server: &Server, device_id: &str, email: &str) -> Result<Self, Error> {
+    async fn open(server: &Server, device_id: &str, email: &str) -> Result<Self, Error> {
         let (api_url, identity_url) = server.urls()?;
+        let dir = ensure_data_dir()?;
+        let registry = StateRegistry::new_with_db(
+            DatabaseConfiguration::Sqlite {
+                db_name: "vault".into(),
+                folder_path: dir,
+            },
+            migrations(),
+        )
+        .await
+        .map_err(storage)?;
+        restrict_permissions(&data_dir());
         let settings = ClientSettings {
             identity_url,
             api_url,
             user_agent: format!("{}/{}", crate::APP_NAME, env!("CARGO_PKG_VERSION")),
             device_type: DeviceType::LinuxDesktop,
             device_identifier: Some(device_id.to_owned()),
-            bitwarden_client_version: None,
+            bitwarden_client_version: Some(COMPAT_CLIENT_VERSION.into()),
             bitwarden_package_type: None,
         };
         let client = ClientBuilder::new()
             .with_settings(settings)
             .with_token_handler(Arc::new(PasswordManagerTokenHandler::default()))
+            .with_state(registry)
             .build();
         Ok(Self {
             client,
+            server: server.clone(),
             email: email.trim().to_owned(),
-            unlock: None,
-            ciphers: Arc::default(),
+            account: None,
+            pin: Arc::default(),
         })
+    }
+
+    /// Nouvelle session vierge : efface d'abord toute donnée locale précédente.
+    pub async fn create(server: &Server, device_id: &str, email: &str) -> Result<Self, Error> {
+        server.urls()?;
+        wipe_local_data();
+        Self::open(server, device_id, email).await
+    }
+
+    /// Restaure la session enregistrée lors d'un lancement précédent (verrouillée).
+    pub async fn restore(device_id: &str) -> Option<Result<Self, Error>> {
+        let data = std::fs::read(account_path()).ok()?;
+        let account: Account = match serde_json::from_slice(&data) {
+            Ok(account) => account,
+            Err(e) => return Some(Err(storage(e))),
+        };
+        Some(
+            Self::open(&account.server, device_id, &account.email)
+                .await
+                .map(|mut session| {
+                    session.account = Some(Arc::new(account));
+                    session
+                }),
+        )
     }
 
     pub fn email(&self) -> &str {
@@ -202,20 +441,22 @@ impl Session {
         Ok(())
     }
 
-    /// Télécharge le coffre et met à jour les données de déverrouillage.
+    /// Télécharge le coffre, l'enregistre (chiffré) et met à jour les données de déverrouillage.
     pub async fn sync(&mut self) -> Result<(), Error> {
         let config = self.client.internal.get_api_configurations();
-        let sync = config
-            .api_client
-            .sync_api()
-            .get(None)
-            .await
-            .map_err(|e| Error::Api(e.to_string()))?;
+        let sync = config.api_client.sync_api().get(None).await.map_err(|e| {
+            let message = e.to_string();
+            if message.contains("401") || message.to_lowercase().contains("not authenticated") {
+                Error::SessionExpired
+            } else {
+                Error::Api(message)
+            }
+        })?;
 
         let profile = sync.profile.ok_or(Error::MissingData("profil"))?;
 
-        let kdf = match self.unlock.as_ref() {
-            Some(unlock) => unlock.kdf.clone(),
+        let kdf = match self.account.as_ref() {
+            Some(account) => account.kdf.clone(),
             None => match self.client.internal.get_kdf().await {
                 Ok(kdf) => kdf,
                 Err(_) => self
@@ -265,7 +506,7 @@ impl Session {
             },
         };
 
-        let org_keys = profile
+        let org_keys: HashMap<_, _> = profile
             .organizations
             .unwrap_or_default()
             .into_iter()
@@ -276,22 +517,49 @@ impl Session {
             })
             .collect();
 
-        let ciphers = sync
+        let user_id = profile.id.map(UserId::new);
+        if let Some(user_id) = user_id
+            && self.client.internal.get_user_id().is_none()
+        {
+            let _ = self.client.internal.init_user_id(user_id).await;
+        }
+
+        let ciphers: Vec<_> = sync
             .ciphers
             .unwrap_or_default()
             .into_iter()
             .filter_map(|c| Cipher::try_from(c).ok())
-            .filter(|c| c.deleted_date.is_none())
+            .filter_map(|c| Some((c.id?, c)))
             .collect();
+        self.client
+            .platform()
+            .state()
+            .get::<Cipher>()
+            .map_err(storage)?
+            .replace_all(ciphers)
+            .await
+            .map_err(storage)?;
 
-        self.unlock = Some(Arc::new(UnlockData {
+        let org_keys_changed = self
+            .account
+            .as_ref()
+            .is_none_or(|a| a.org_keys.len() != org_keys.len());
+
+        let account = Account {
+            server: self.server.clone(),
+            email: self.email.clone(),
+            user_id,
             kdf,
             master_password_unlock,
-            account_state: serde_json::to_string(&account_state)
-                .map_err(|e| Error::Crypto(e.to_string()))?,
+            account_state,
             org_keys,
-        }));
-        self.ciphers = Arc::new(ciphers);
+        };
+        save_account(&account)?;
+        self.account = Some(Arc::new(account));
+
+        if org_keys_changed && self.is_unlocked() {
+            self.init_org_crypto().await?;
+        }
         Ok(())
     }
 
@@ -303,36 +571,41 @@ impl Session {
             .has_symmetric_key(SymmetricKeySlotId::User)
     }
 
-    /// Déverrouille localement (sans réseau) à partir des données de la dernière synchro.
-    pub async fn unlock(&self, password: String) -> Result<(), Error> {
-        let unlock = self
-            .unlock
-            .as_ref()
-            .ok_or(Error::MissingData("synchronisation"))?;
-        if !self.is_unlocked() {
-            let account_cryptographic_state = serde_json::from_str(&unlock.account_state)
-                .map_err(|e| Error::Crypto(e.to_string()))?;
-            self.client
-                .crypto()
-                .initialize_user_crypto(InitUserCryptoRequest {
-                    user_id: None,
-                    kdf_params: unlock.kdf.clone(),
-                    email: self.email.clone(),
-                    account_cryptographic_state,
-                    method: InitUserCryptoMethod::MasterPasswordUnlock {
-                        password,
-                        master_password_unlock: unlock.master_password_unlock.clone(),
-                    },
-                    upgrade_token: None,
-                })
-                .await
-                .map_err(|_| Error::WrongPassword)?;
+    fn account(&self) -> Result<&Account, Error> {
+        self.account
+            .as_deref()
+            .ok_or(Error::MissingData("synchronisation"))
+    }
+
+    async fn init_user_crypto(&self, method: InitUserCryptoMethod) -> Result<(), Error> {
+        let account = self.account()?;
+        if let Some(user_id) = account.user_id
+            && self.client.internal.get_user_id().is_none()
+        {
+            let _ = self.client.internal.init_user_id(user_id).await;
         }
-        if !unlock.org_keys.is_empty() {
+        self.client
+            .crypto()
+            .initialize_user_crypto(InitUserCryptoRequest {
+                user_id: None,
+                kdf_params: account.kdf.clone(),
+                email: self.email.clone(),
+                account_cryptographic_state: account.account_state.clone(),
+                method,
+                upgrade_token: None,
+            })
+            .await
+            .map_err(|e| Error::Crypto(e.to_string()))?;
+        self.init_org_crypto().await
+    }
+
+    async fn init_org_crypto(&self) -> Result<(), Error> {
+        let account = self.account()?;
+        if !account.org_keys.is_empty() {
             self.client
                 .crypto()
                 .initialize_org_crypto(InitOrgCryptoRequest {
-                    organization_keys: unlock.org_keys.clone(),
+                    organization_keys: account.org_keys.clone(),
                 })
                 .await
                 .map_err(|e| Error::Crypto(e.to_string()))?;
@@ -340,18 +613,127 @@ impl Session {
         Ok(())
     }
 
+    /// Déverrouille localement (sans réseau) avec le mot de passe maître.
+    pub async fn unlock(&self, password: String) -> Result<(), Error> {
+        if self.is_unlocked() {
+            return self.init_org_crypto().await;
+        }
+        let master_password_unlock = self.account()?.master_password_unlock.clone();
+        self.init_user_crypto(InitUserCryptoMethod::MasterPasswordUnlock {
+            password,
+            master_password_unlock,
+        })
+        .await
+        .map_err(|e| match e {
+            Error::Crypto(_) => Error::WrongPassword,
+            e => e,
+        })?;
+        // Un déverrouillage par mot de passe réarme le compteur d'essais du NIP.
+        if let Some(pin) = self.pin.lock().expect("verrou NIP").as_mut() {
+            pin.attempts_left = PIN_ATTEMPTS;
+        }
+        Ok(())
+    }
+
+    /// Le NIP n'est conservé qu'en mémoire : il est perdu à la fermeture de
+    /// l'application, comme l'option par défaut des clients officiels.
+    pub fn has_pin(&self) -> bool {
+        self.pin.lock().expect("verrou NIP").is_some()
+    }
+
+    pub fn set_pin(&self, pin: String) -> Result<(), Error> {
+        let response = self
+            .client
+            .crypto()
+            .enroll_pin(pin)
+            .map_err(|e| Error::Crypto(e.to_string()))?;
+        *self.pin.lock().expect("verrou NIP") = Some(PinState {
+            envelope: response.pin_protected_user_key_envelope,
+            attempts_left: PIN_ATTEMPTS,
+        });
+        Ok(())
+    }
+
+    pub fn clear_pin(&self) {
+        *self.pin.lock().expect("verrou NIP") = None;
+    }
+
+    pub async fn unlock_with_pin(&self, pin: String) -> Result<(), Error> {
+        let envelope = self
+            .pin
+            .lock()
+            .expect("verrou NIP")
+            .as_ref()
+            .map(|p| p.envelope.clone())
+            .ok_or(Error::PinDisabled)?;
+        let result = self
+            .init_user_crypto(InitUserCryptoMethod::PinEnvelope {
+                pin,
+                pin_protected_user_key_envelope: envelope,
+            })
+            .await;
+        let mut guard = self.pin.lock().expect("verrou NIP");
+        match result {
+            Ok(()) => {
+                if let Some(state) = guard.as_mut() {
+                    state.attempts_left = PIN_ATTEMPTS;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("échec du déverrouillage par NIP : {e}");
+                let left = guard
+                    .as_ref()
+                    .map_or(0, |s| s.attempts_left.saturating_sub(1));
+                if left == 0 {
+                    *guard = None;
+                    Err(Error::PinDisabled)
+                } else {
+                    if let Some(state) = guard.as_mut() {
+                        state.attempts_left = left;
+                    }
+                    Err(Error::WrongPin(left))
+                }
+            }
+        }
+    }
+
     /// Efface toutes les clés déchiffrées de la mémoire.
     pub fn lock(&self) {
         self.client.internal.get_key_store().clear();
     }
 
-    /// Liste déchiffrée (noms, sous-titres) des éléments, triée par nom.
-    pub async fn list(&self) -> Vec<CipherListView> {
+    /// Déconnexion : verrouille, oublie le NIP et supprime les données locales.
+    pub fn logout(&self) {
+        self.lock();
+        self.clear_pin();
+        wipe_local_data();
+    }
+
+    async fn stored_ciphers(&self) -> Result<Vec<Cipher>, Error> {
+        self.client
+            .platform()
+            .state()
+            .get::<Cipher>()
+            .map_err(storage)?
+            .list()
+            .await
+            .map_err(storage)
+    }
+
+    /// Liste déchiffrée (hors corbeille) des éléments, triée par nom.
+    pub async fn list(&self) -> Result<Vec<CipherListView>, Error> {
+        let ciphers = self
+            .stored_ciphers()
+            .await?
+            .into_iter()
+            .filter(|c| c.deleted_date.is_none())
+            .collect();
         let result = self
             .client
             .vault()
             .ciphers()
-            .decrypt_list_with_failures(self.ciphers.as_ref().clone())
+            .decrypt_list_with_failures(ciphers)
             .await;
         if !result.failures.is_empty() {
             eprintln!(
@@ -361,19 +743,188 @@ impl Session {
         }
         let mut items = result.successes;
         items.sort_by_key(|item| item.name.to_lowercase());
-        items
+        Ok(items)
+    }
+
+    fn parse_id(id: &str) -> Result<CipherId, Error> {
+        id.parse().map_err(|_| Error::ItemNotFound)
     }
 
     /// Déchiffre un élément complet (mot de passe, notes, etc.).
     pub async fn get(&self, id: &str) -> Result<CipherView, Error> {
         let cipher = self
-            .ciphers
-            .iter()
-            .find(|c| c.id.is_some_and(|cid| cid.to_string() == id))
-            .cloned()
+            .client
+            .platform()
+            .state()
+            .get::<Cipher>()
+            .map_err(storage)?
+            .get(Self::parse_id(id)?)
+            .await
+            .map_err(storage)?
             .ok_or(Error::ItemNotFound)?;
         Ok(self.client.vault().ciphers().decrypt(cipher).await?)
     }
+
+    /// Chiffre `view` avec le SDK et l'envoie au serveur (création si `id` est `None`),
+    /// puis resynchronise le coffre local.
+    async fn save_view(&mut self, id: Option<CipherId>, view: CipherView) -> Result<(), Error> {
+        use bitwarden_api_api::models::CipherRequestModel;
+        let context = self
+            .client
+            .vault()
+            .ciphers()
+            .encrypt(view)
+            .await
+            .map_err(|e| Error::Crypto(e.to_string()))?;
+        let request = CipherRequestModel::from(context);
+        let api = self.client.internal.get_api_configurations();
+        let ciphers = api.api_client.ciphers_api();
+        match id {
+            Some(id) => ciphers.put(id.into(), Some(request)).await.map(drop),
+            None => ciphers.post(Some(request)).await.map(drop),
+        }
+        .map_err(|e| Error::Api(e.to_string()))?;
+        self.sync().await
+    }
+
+    /// Crée un élément sur le serveur.
+    pub async fn create_item(&mut self, kind: ItemKind, draft: ItemDraft) -> Result<(), Error> {
+        let name = non_empty(&draft.name).ok_or(Error::EmptyName)?;
+        let now = chrono::Utc::now();
+        let (r#type, login, secure_note) = match kind {
+            ItemKind::Login => (
+                CipherType::Login,
+                Some(draft.apply_login(empty_login())),
+                None,
+            ),
+            ItemKind::SecureNote => (
+                CipherType::SecureNote,
+                None,
+                Some(SecureNoteView {
+                    r#type: SecureNoteType::Generic,
+                }),
+            ),
+        };
+        let view = CipherView {
+            partial: false,
+            id: None,
+            organization_id: None,
+            folder_id: None,
+            collection_ids: vec![],
+            key: None,
+            name,
+            notes: non_empty(&draft.notes),
+            r#type,
+            login,
+            identity: None,
+            card: None,
+            secure_note,
+            ssh_key: None,
+            bank_account: None,
+            drivers_license: None,
+            passport: None,
+            favorite: false,
+            reprompt: CipherRepromptType::None,
+            organization_use_totp: false,
+            edit: true,
+            permissions: None,
+            view_password: true,
+            local_data: None,
+            attachments: None,
+            attachment_decryption_failures: None,
+            fields: None,
+            password_history: None,
+            creation_date: now,
+            deleted_date: None,
+            revision_date: now,
+            archived_date: None,
+        };
+        self.save_view(None, view).await
+    }
+
+    /// Modifie un élément existant; l'ancien mot de passe rejoint l'historique.
+    pub async fn edit_item(&mut self, id: &str, draft: ItemDraft) -> Result<(), Error> {
+        let name = non_empty(&draft.name).ok_or(Error::EmptyName)?;
+        let cipher_id = Self::parse_id(id)?;
+        let mut view = self.get(id).await?;
+        if !view.edit {
+            return Err(Error::ReadOnly);
+        }
+        view.name = name;
+        view.notes = non_empty(&draft.notes);
+        if let Some(login) = view.login.take() {
+            let old_password = login.password.clone();
+            let login = draft.apply_login(login);
+            if let Some(old) = old_password.filter(|old| Some(old) != login.password.as_ref()) {
+                let now = chrono::Utc::now();
+                let mut history = vec![PasswordHistoryView {
+                    password: old,
+                    last_used_date: now,
+                }];
+                history.extend(view.password_history.take().unwrap_or_default());
+                history.truncate(PASSWORD_HISTORY_LEN);
+                view.password_history = Some(history);
+                view.login = Some(LoginView {
+                    password_revision_date: Some(now),
+                    ..login
+                });
+            } else {
+                view.login = Some(login);
+            }
+        }
+        self.save_view(Some(cipher_id), view).await
+    }
+
+    /// Envoie l'élément à la corbeille (récupérable depuis le coffre web).
+    pub async fn trash(&self, id: &str) -> Result<(), Error> {
+        self.client
+            .vault()
+            .ciphers()
+            .soft_delete(Self::parse_id(id)?)
+            .await
+            .map_err(|e| Error::Api(e.to_string()))
+    }
+
+    /// Mot de passe aléatoire de 20 caractères (générateur du SDK).
+    pub fn generate_password(&self) -> Result<String, Error> {
+        self.client
+            .generator()
+            .password(PasswordGeneratorRequest {
+                lowercase: true,
+                uppercase: true,
+                numbers: true,
+                special: true,
+                length: 20,
+                avoid_ambiguous: true,
+                min_lowercase: Some(1),
+                min_uppercase: Some(1),
+                min_number: Some(1),
+                min_special: Some(1),
+                custom_required_chars: None,
+                custom_allowed_chars: None,
+                max_consecutive: None,
+            })
+            .map_err(|e| Error::Crypto(e.to_string()))
+    }
+}
+
+fn save_account(account: &Account) -> Result<(), Error> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    ensure_data_dir()?;
+    let path = account_path();
+    let tmp = path.with_extension("json.tmp");
+    let data = serde_json::to_vec_pretty(account).map_err(storage)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(storage)?;
+    file.write_all(&data).map_err(storage)?;
+    file.sync_all().map_err(storage)?;
+    std::fs::rename(&tmp, &path).map_err(storage)
 }
 
 /// Code TOTP courant et secondes restantes, à partir de la clé stockée dans l'élément.
@@ -427,20 +978,229 @@ mod tests {
         assert!((1..=30).contains(&remaining));
     }
 
+    #[test]
+    fn brouillon_applique_a_un_identifiant() {
+        let draft = ItemDraft {
+            name: "Exemple".into(),
+            username: " moi@exemple.ca ".into(),
+            password: " secret ".into(),
+            uri: "https://exemple.ca".into(),
+            totp: String::new(),
+            notes: String::new(),
+        };
+        let login = draft.apply_login(empty_login());
+        assert_eq!(login.username.as_deref(), Some("moi@exemple.ca"));
+        // Les espaces d'un mot de passe sont significatifs.
+        assert_eq!(login.password.as_deref(), Some(" secret "));
+        assert_eq!(login.totp, None);
+        let uris = login.uris.unwrap();
+        assert_eq!(uris.len(), 1);
+        assert_eq!(uris[0].uri.as_deref(), Some("https://exemple.ca"));
+    }
+
+    #[test]
+    fn brouillon_vide_retire_le_site() {
+        let mut login = empty_login();
+        login.uris = Some(vec![LoginUriView {
+            uri: Some("https://ancien.ca".into()),
+            r#match: None,
+            uri_checksum: None,
+        }]);
+        let login = ItemDraft::default().apply_login(login);
+        assert!(login.uris.is_none());
+        assert!(login.password.is_none());
+    }
+
     /// Vérifie le chemin réseau réel : `cargo test -- --ignored`.
     #[test]
     #[ignore]
     fn connexion_refusee_sur_bitwarden_com() {
         crate::runtime().block_on(async {
-            let session = Session::new(
+            let session = Session::create(
                 &Server::BitwardenUs,
                 "00000000-0000-4000-8000-000000000000",
                 "coffre-test-inexistant@example.com",
             )
+            .await
             .unwrap();
             let result = session.login("mauvais mot de passe".into(), None).await;
             let err = result.err().expect("la connexion aurait dû échouer");
             eprintln!("erreur obtenue : {err}");
+            assert!(matches!(err, Error::BadCredentials));
+        });
+    }
+
+    /// Parcours complet contre un serveur Vaultwarden local :
+    /// `COFFRE_E2E_SERVER=http://127.0.0.1:8000 cargo test e2e -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn e2e_vaultwarden() {
+        let Ok(server_url) = std::env::var("COFFRE_E2E_SERVER") else {
+            eprintln!("COFFRE_E2E_SERVER non défini : test ignoré");
+            return;
+        };
+        let server = Server::SelfHosted(server_url.clone());
+        let email = format!("e2e-{}@exemple.ca", uuid::Uuid::new_v4().simple());
+        let password = "Mot de passe maître très long 123!".to_owned();
+        let device = "11111111-2222-4333-8444-555555555555";
+
+        crate::runtime().block_on(async {
+            // 1. Inscription (clés générées côté client par le SDK).
+            let keys = Client::new(None)
+                .auth()
+                .make_register_keys(email.clone(), password.clone(), Kdf::default_pbkdf2())
+                .unwrap();
+            let body = serde_json::json!({
+                "email": email,
+                "name": "E2E",
+                "kdf": 0,
+                "kdfIterations": 600000,
+                "key": keys.encrypted_user_key.to_string(),
+                "masterPasswordHash": keys.master_password_hash.to_string(),
+                "keys": {
+                    "publicKey": keys.keys.public.to_string(),
+                    "encryptedPrivateKey": keys.keys.private.to_string(),
+                },
+            });
+            let response = reqwest::Client::new()
+                .post(format!("{server_url}/identity/accounts/register"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                response.status().is_success(),
+                "inscription : {}",
+                response.text().await.unwrap()
+            );
+
+            // 2. Mauvais mot de passe, puis connexion, synchro et déverrouillage.
+            let mut session = Session::create(&server, device, &email).await.unwrap();
+            assert!(matches!(
+                session.login("mauvais".into(), None).await,
+                Err(Error::BadCredentials)
+            ));
+            assert!(matches!(
+                session.login(password.clone(), None).await.unwrap(),
+                LoginOutcome::Authenticated
+            ));
+            session.sync().await.unwrap();
+            session.unlock(password.clone()).await.unwrap();
+            assert!(session.is_unlocked());
+            assert!(session.list().await.unwrap().is_empty());
+
+            // 3. Création d'un identifiant et d'une note.
+            let draft = ItemDraft {
+                name: "Exemple".into(),
+                username: "moi@exemple.ca".into(),
+                password: "ancien-secret".into(),
+                uri: "https://exemple.ca".into(),
+                totp: "JBSWY3DPEHPK3PXP".into(),
+                notes: "note privée".into(),
+            };
+            session
+                .create_item(ItemKind::Login, draft.clone())
+                .await
+                .unwrap();
+            session
+                .create_item(
+                    ItemKind::SecureNote,
+                    ItemDraft {
+                        name: "Note".into(),
+                        notes: "contenu".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let items = session.list().await.unwrap();
+            assert_eq!(items.len(), 2);
+            let id = items
+                .iter()
+                .find(|i| i.name == "Exemple")
+                .unwrap()
+                .id
+                .unwrap()
+                .to_string();
+            let view = session.get(&id).await.unwrap();
+            let login = view.login.as_ref().unwrap();
+            assert_eq!(login.password.as_deref(), Some("ancien-secret"));
+            assert_eq!(login.totp.as_deref(), Some("JBSWY3DPEHPK3PXP"));
+            assert_eq!(view.notes.as_deref(), Some("note privée"));
+
+            // 4. Modification : l'ancien mot de passe passe dans l'historique.
+            let generated = session.generate_password().unwrap();
+            assert_eq!(generated.chars().count(), 20);
+            let edited = ItemDraft {
+                password: generated.clone(),
+                name: "Exemple modifié".into(),
+                ..draft
+            };
+            session.edit_item(&id, edited).await.unwrap();
+            let view = session.get(&id).await.unwrap();
+            assert_eq!(view.name, "Exemple modifié");
+            assert_eq!(
+                view.login.as_ref().unwrap().password.as_deref(),
+                Some(generated.as_str())
+            );
+            let history = view.password_history.unwrap();
+            assert_eq!(history[0].password, "ancien-secret");
+
+            // 5. NIP : mauvais NIP, puis bon NIP après verrouillage.
+            session.set_pin("2468".into()).unwrap();
+            session.lock();
+            assert!(!session.is_unlocked());
+            assert!(matches!(
+                session.unlock_with_pin("1111".into()).await,
+                Err(Error::WrongPin(4))
+            ));
+            session.unlock_with_pin("2468".into()).await.unwrap();
+            assert!(session.is_unlocked());
+
+            // 6. Corbeille.
+            session.trash(&id).await.unwrap();
+            assert_eq!(session.list().await.unwrap().len(), 1);
+
+            // 7. Restauration de session (nouveau lancement) : verrouillée, sans NIP,
+            //    déverrouillage hors ligne puis synchro avec le jeton persisté.
+            session.lock();
+            drop(session);
+            let mut restored = Session::restore(device).await.unwrap().unwrap();
+            assert_eq!(restored.email(), email);
+            assert!(!restored.is_unlocked());
+            assert!(!restored.has_pin());
+            assert!(matches!(
+                restored.unlock("mauvais".into()).await,
+                Err(Error::WrongPassword)
+            ));
+            restored.unlock(password.clone()).await.unwrap();
+            assert_eq!(restored.list().await.unwrap().len(), 1);
+            restored.sync().await.unwrap();
+            assert_eq!(restored.list().await.unwrap()[0].name, "Note");
+
+            // 8. Déconnexion : plus rien à restaurer.
+            if std::env::var_os("COFFRE_E2E_KEEP").is_some() {
+                // Garde le compte pour une vérification manuelle de l'interface.
+                restored
+                    .create_item(
+                        ItemKind::Login,
+                        ItemDraft {
+                            name: "Banque Nationale".into(),
+                            username: "client@exemple.ca".into(),
+                            password: "S3cret!".into(),
+                            uri: "https://www.bnc.ca".into(),
+                            totp: "JBSWY3DPEHPK3PXP".into(),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                eprintln!("compte conservé : {email}");
+                return;
+            }
+            restored.logout();
+            assert!(Session::restore(device).await.is_none());
+            eprintln!("parcours complet réussi pour {email}");
         });
     }
 }

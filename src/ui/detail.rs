@@ -1,7 +1,9 @@
 //! Détail d'un élément déchiffré.
 
 use adw::prelude::*;
-use bitwarden_vault::{CipherView, FieldType};
+use bitwarden_vault::{CipherType, CipherView, FieldType};
+
+use crate::backend::{ItemDraft, ItemKind};
 use gtk::glib;
 
 use super::{App, icon_button, page};
@@ -102,7 +104,26 @@ pub fn detail_page(app: &App, view: CipherView) -> adw::NavigationPage {
         content.append(&group);
     }
 
-    page(&view.name, "detail", &adw::HeaderBar::new(), &content)
+    let header = adw::HeaderBar::new();
+    let editable = view.edit
+        && matches!(view.r#type, CipherType::Login | CipherType::SecureNote)
+        && view.id.is_some();
+    if editable {
+        let edit = icon_button("document-edit-symbolic", "Modifier");
+        let kind = if view.r#type == CipherType::Login {
+            ItemKind::Login
+        } else {
+            ItemKind::SecureNote
+        };
+        let (app, id, draft) = (
+            app.clone(),
+            view.id.map(|id| id.to_string()),
+            ItemDraft::from_view(&view),
+        );
+        edit.connect_clicked(move |_| app.show_editor(id.clone(), kind, draft.clone()));
+        header.pack_end(&edit);
+    }
+    page(&view.name, "detail", &header, &content)
 }
 
 /// Rangée avec bouton de copie; si `secret`, la valeur est masquée et un bouton permet de l'afficher.
