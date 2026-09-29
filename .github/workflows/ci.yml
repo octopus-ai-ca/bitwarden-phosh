@@ -22,3 +22,16 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+
+  # Paquet natif postmarketOS (Alpine 3.24 = postmarketOS v26.06), compilé
+  # dans un conteneur lancé à la main : les actions JavaScript ne tournent pas
+  # dans un conteneur Alpine sur les exécuteurs ARM64.
+  apk:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker run --rm -v "$PWD:/src" alpine:3.24 /src/packaging/postmarketos/build-apk.sh

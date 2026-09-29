@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Étiquette à publier (ex. v0.2.0)"
+        description: "Étiquette à publier (ex. v0.2.1)"
         required: true
 
 permissions:
@@ -17,6 +17,38 @@ env:
   TAG: ${{ inputs.version || github.ref_name }}
 
 jobs:
+  # Paquets natifs postmarketOS / Alpine 3.24.
+  apk:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Vérifier la version de l'APKBUILD
+        run: |
+          pkgver=$(sed -n 's/^pkgver=//p' packaging/postmarketos/APKBUILD)
+          test "v$pkgver" = "$TAG" || { echo "APKBUILD ($pkgver) ≠ $TAG"; exit 1; }
+      - run: docker run --rm -v "$PWD:/src" alpine:3.24 /src/packaging/postmarketos/build-apk.sh
+      - name: Renommer par architecture
+        run: |
+          cd dist
+          for f in coffre-*.apk; do sudo mv "$f" "${f%.apk}-${{ matrix.arch }}.apk"; done
+          for f in *.rsa.pub; do sudo mv "$f" "coffre-${{ matrix.arch }}.rsa.pub"; done
+          sha256sum coffre-*-${{ matrix.arch }}.apk | sudo tee coffre-${{ matrix.arch }}.apk.sha256
+          if [ "${{ matrix.arch }}" != aarch64 ]; then sudo rm -f APKBUILD coffre-*.tar.gz; fi
+          ls -l
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ matrix.arch }}
+          path: dist/*
+
+  # Binaires glibc (Debian, Ubuntu, Fedora…), sans paquet.
   binaires:
     strategy:
       fail-fast: false
@@ -33,11 +65,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked
       - run: cargo build --release --locked
       - name: Archive
         run: |
-          name=coffre-${TAG}-linux-${{ matrix.arch }}
+          name=coffre-${TAG}-linux-glibc-${{ matrix.arch }}
           mkdir -p "$name"
           cp target/release/coffre "$name/"
           cp -r data LICENSE README.md install.sh "$name/"
@@ -48,30 +79,8 @@ jobs:
           name: binaire-${{ matrix.arch }}
           path: coffre-*.tar.gz*
 
-  flatpak:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-            runner: ubuntu-24.04
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
-    container:
-      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
-      options: --privileged
-    steps:
-      - uses: actions/checkout@v4
-      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
-        with:
-          bundle: coffre-${{ matrix.arch }}.flatpak
-          manifest-path: build-aux/ca.octopusai.Coffre.json
-          arch: ${{ matrix.arch }}
-          cache-key: flatpak-builder-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
-
   publier:
-    needs: [binaires, flatpak]
+    needs: [apk, binaires]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -87,6 +96,7 @@ jobs:
             on && /^## \[/ { exit }
             on { print }
           ' CHANGELOG.md > notes.md
+          test -s notes.md
           cat notes.md
       - uses: softprops/action-gh-release@v2
         with:
@@ -96,6 +106,10 @@ jobs:
           body_path: notes.md
           fail_on_unmatched_files: true
           files: |
-            artefacts/**/*.tar.gz
-            artefacts/**/*.sha256
-            artefacts/**/*.flatpak
+            artefacts/apk-*/*.apk
+            artefacts/apk-*/*.sha256
+            artefacts/apk-*/*.rsa.pub
+            artefacts/apk-aarch64/APKBUILD
+            artefacts/apk-aarch64/coffre-*.tar.gz
+            artefacts/binaire-*/*.tar.gz
+            artefacts/binaire-*/*.sha256

@@ -1,0 +1,50 @@
+# Contributor: Octopus AI
+# Maintainer: Octopus AI
+pkgname=coffre
+pkgver=0.2.1
+pkgrel=0
+pkgdesc="Client Bitwarden adaptatif pour Phosh (GTK4/libadwaita)"
+url="https://github.com/octopus-ai-ca/bitwarden-phosh"
+# Le SDK Bitwarden n'est testé que sur ces architectures 64 bits.
+arch="aarch64 x86_64"
+license="GPL-3.0-only"
+# Certificats racines lus par rustls-platform-verifier (appels HTTPS du SDK).
+depends="ca-certificates-bundle"
+makedepends="
+	cargo
+	cargo-auditable
+	cmake
+	gtk4.0-dev
+	libadwaita-dev
+	perl
+	"
+# Le SDK officiel est une dépendance Git : `cargo fetch` a besoin du réseau.
+options="net"
+source="$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz"
+
+prepare() {
+	default_prepare
+	cargo fetch --target="$CTARGET" --locked
+}
+
+build() {
+	cargo auditable build --frozen --release
+}
+
+check() {
+	cargo test --frozen --release
+}
+
+package() {
+	install -Dm755 target/release/coffre "$pkgdir"/usr/bin/coffre
+	install -Dm644 data/ca.octopusai.Coffre.desktop \
+		"$pkgdir"/usr/share/applications/ca.octopusai.Coffre.desktop
+	install -Dm644 data/ca.octopusai.Coffre.metainfo.xml \
+		"$pkgdir"/usr/share/metainfo/ca.octopusai.Coffre.metainfo.xml
+	install -Dm644 data/icons/hicolor/scalable/apps/ca.octopusai.Coffre.svg \
+		"$pkgdir"/usr/share/icons/hicolor/scalable/apps/ca.octopusai.Coffre.svg
+}
+
+sha512sums="
+SKIP  coffre-0.2.1.tar.gz
+"

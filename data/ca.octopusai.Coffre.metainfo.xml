@@ -35,6 +35,11 @@
     <control>pointing</control>
   </supports>
   <releases>
+    <release version="0.2.1" date="2026-09-29">
+      <description>
+        <p>Paquet natif postmarketOS ; retrait du Flatpak.</p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-09-29">
       <description>
         <p>Première version publiée : connexion et 2FA, coffre hors ligne, session conservée,

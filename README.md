@@ -57,17 +57,47 @@ appareil » de la 2FA n'est pas exposée par le SDK (la 2FA n'est toutefois dema
 la première connexion) ; seuls les identifiants et les notes sécurisées sont modifiables ;
 pas de pièces jointes ni de dossiers.
 
-## Installation
+## Installation sur postmarketOS
 
-Depuis la [page des publications](https://github.com/octopus-ai-ca/bitwarden-phosh/releases) :
+Paquet natif pour **postmarketOS v26.06** (Alpine 3.24) et edge, sur aarch64 (téléphones)
+ou x86_64. Depuis la [page des publications](https://github.com/octopus-ai-ca/bitwarden-phosh/releases) :
 
 ```sh
-# Flatpak (recommandé ; remplacer aarch64 par x86_64 selon l'appareil)
-flatpak install --user coffre-aarch64.flatpak
-
-# ou archive binaire (requiert GTK 4.14+ et libadwaita 1.5+)
-tar xzf coffre-v0.2.0-linux-aarch64.tar.gz && ./coffre-v0.2.0-linux-aarch64/install.sh
+wget https://github.com/octopus-ai-ca/bitwarden-phosh/releases/download/v0.2.1/coffre-0.2.1-r0-aarch64.apk
+wget https://github.com/octopus-ai-ca/bitwarden-phosh/releases/download/v0.2.1/coffre-aarch64.apk.sha256
+sha256sum -c coffre-aarch64.apk.sha256
+doas apk add --allow-untrusted ./coffre-0.2.1-r0-aarch64.apk
 ```
+
+`--allow-untrusted` est nécessaire, car le paquet est signé par une clé propre à chaque
+compilation. On peut plutôt installer la clé publique publiée (`coffre-aarch64.rsa.pub`)
+dans `/etc/apk/keys/`.
+
+### Compiler le paquet soi-même
+
+Sur le téléphone (ou dans `pmbootstrap chroot`), avec l'APKBUILD de la publication :
+
+```sh
+doas apk add alpine-sdk
+abuild-keygen -a -i
+mkdir coffre && cd coffre
+wget https://github.com/octopus-ai-ca/bitwarden-phosh/releases/download/v0.2.1/APKBUILD
+abuild -r
+```
+
+Ou depuis ce dépôt, dans un conteneur Alpine :
+
+```sh
+docker run --rm -v "$PWD:/src" alpine:3.24 /src/packaging/postmarketos/build-apk.sh
+```
+
+Alpine 3.23 et plus ancienne (postmarketOS v25.12 et avant) ne sont pas prises en charge :
+leur rustc est trop ancien pour gtk-rs 0.11.
+
+### Autres distributions (glibc)
+
+Les archives `coffre-v0.2.1-linux-glibc-*.tar.gz` visent Debian, Ubuntu ou Fedora (GTK
+4.14+ et libadwaita 1.5+) : extraire puis lancer `install.sh`.
 
 ## Compilation
 
@@ -87,24 +117,6 @@ cargo test -- --ignored   # test réseau réel contre bitwarden.com
 COFFRE_E2E_SERVER=http://127.0.0.1:8000 cargo test e2e -- --ignored
 ```
 
-### Flatpak (x86_64 et aarch64)
-
-```sh
-flatpak-builder --user --install --force-clean build-dir build-aux/ca.octopusai.Coffre.json
-flatpak run ca.octopusai.Coffre
-```
-
-Après toute modification de `Cargo.lock`, régénérer les sources hors ligne :
-
-```sh
-python3 flatpak-cargo-generator.py Cargo.lock -o build-aux/cargo-sources.json
-```
-
-(script disponible dans [flatpak-builder-tools](https://github.com/flatpak/flatpak-builder-tools/tree/master/cargo)).
-
-Le fichier `.desktop` déclare `X-Purism-FormFactor=Workstation;Mobile;` pour que Phosh
-affiche l'application en mode téléphone.
-
 ## Structure
 
 ```
@@ -119,6 +131,6 @@ src/
     ├── detail.rs  Détail d'un élément
     └── edit.rs    Création et modification
 data/              .desktop, metainfo, icône
-build-aux/         Manifeste Flatpak (GNOME 50) et sources Cargo
-.github/workflows/ CI et publication (binaires + Flatpak, x86_64 et aarch64)
+packaging/         APKBUILD postmarketOS et script de compilation Alpine
+.github/workflows/ CI et publication (.apk postmarketOS + binaires glibc, x86_64 et aarch64)
 ```

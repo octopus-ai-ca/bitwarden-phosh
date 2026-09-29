@@ -3,6 +3,19 @@
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et le projet
 respecte le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [0.2.1] - 2026-09-29
+
+### Ajouté
+- Paquet natif postmarketOS (`.apk` pour Alpine 3.24 / postmarketOS v26.06, aarch64 et
+  x86_64) et son APKBUILD.
+
+### Retiré
+- Paquet Flatpak.
+
+### Modifié
+- Les archives binaires sont renommées `linux-glibc` : elles visent Debian, Ubuntu ou
+  Fedora et ne fonctionnent pas sur postmarketOS (musl).
+
 ## [0.2.0] - 2026-09-29
 
 Première version publiée.
@@ -24,4 +37,5 @@ Première version publiée.
 - Interface adaptative GTK4/libadwaita pour Phosh et GNOME ; paquet Flatpak et
   binaires x86_64 et aarch64.
 
+[0.2.1]: https://github.com/octopus-ai-ca/bitwarden-phosh/releases/tag/v0.2.1
 [0.2.0]: https://github.com/octopus-ai-ca/bitwarden-phosh/releases/tag/v0.2.0
