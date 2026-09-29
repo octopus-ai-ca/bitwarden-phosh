@@ -2,7 +2,7 @@
 name = "coffre"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.92"
 description = "Client Bitwarden adaptatif pour Phosh (GTK4/libadwaita)"
 license = "GPL-3.0-only"
 publish = false

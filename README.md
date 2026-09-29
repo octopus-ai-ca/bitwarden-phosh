@@ -77,7 +77,7 @@ Dépendances (Debian/Mobian/Ubuntu) :
 sudo apt install build-essential pkg-config libgtk-4-dev libadwaita-1-dev
 ```
 
-Rust 1.88 ou plus récent est requis (exigence du SDK).
+Rust 1.92 ou plus récent est requis (exigences de gtk-rs 0.11 et du SDK).
 
 ```sh
 cargo run            # développement
@@ -119,6 +119,6 @@ src/
     ├── detail.rs  Détail d'un élément
     └── edit.rs    Création et modification
 data/              .desktop, metainfo, icône
-build-aux/         Manifeste Flatpak et sources Cargo
+build-aux/         Manifeste Flatpak (GNOME 50) et sources Cargo
 .github/workflows/ CI et publication (binaires + Flatpak, x86_64 et aarch64)
 ```
