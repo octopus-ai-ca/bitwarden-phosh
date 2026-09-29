@@ -4,6 +4,7 @@
 mod detail;
 mod edit;
 mod login;
+mod two_factor;
 mod vault;
 
 use std::cell::RefCell;
@@ -240,8 +241,9 @@ impl App {
         password: String,
         options: crate::backend::TwoFactorOptions,
     ) {
-        self.nav
-            .push(&login::two_factor_page(self, session, password, options));
+        self.nav.push(&two_factor::two_factor_page(
+            self, session, password, options,
+        ));
     }
 
     fn show_vault(&self) {

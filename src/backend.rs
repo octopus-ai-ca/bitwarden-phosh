@@ -44,6 +44,18 @@ use bitwarden_vault::{
 /// Vaultwarden) consultent pour activer les fonctions récentes.
 const COMPAT_CLIENT_VERSION: &str = "2026.9.0";
 
+/// Identifiant d'appareil qu'envoie la connexion par mot de passe du SDK.
+const SDK_LOGIN_DEVICE_ID: &str = "b86dd6ab-4265-4ddf-a7f1-eb28d5677f33";
+
+/// Extrait les options WebAuthn (fournisseur 7) d'une réponse « 2FA requise ».
+fn webauthn_options(response: &serde_json::Value) -> Option<serde_json::Value> {
+    let providers = response.as_object()?.iter().find_map(|(key, value)| {
+        key.eq_ignore_ascii_case("TwoFactorProviders2")
+            .then_some(value)
+    })?;
+    providers.get("7").filter(|v| v.is_object()).cloned()
+}
+
 /// Nombre d'essais de NIP avant d'exiger le mot de passe maître.
 pub const PIN_ATTEMPTS: u8 = 5;
 /// Nombre d'anciens mots de passe conservés (comme les clients officiels).
@@ -152,6 +164,25 @@ fn storage<E: std::fmt::Display>(e: E) -> Error {
 pub struct TwoFactorOptions {
     pub authenticator: bool,
     pub email: bool,
+    /// YubiKey OTP : la clé « tape » un code de 44 caractères (USB).
+    pub yubikey: bool,
+    /// Clé de sécurité FIDO2 (USB ou NFC).
+    pub webauthn: bool,
+}
+
+impl TwoFactorOptions {
+    /// Méthodes proposées, de la plus pratique sur téléphone à la moins pratique.
+    pub fn methods(&self) -> Vec<TwoFactorMethod> {
+        [
+            (self.webauthn, TwoFactorMethod::WebAuthn),
+            (self.yubikey, TwoFactorMethod::YubiKey),
+            (self.authenticator, TwoFactorMethod::Authenticator),
+            (self.email, TwoFactorMethod::Email),
+        ]
+        .into_iter()
+        .filter_map(|(available, method)| available.then_some(method))
+        .collect()
+    }
 }
 
 pub enum LoginOutcome {
@@ -164,6 +195,19 @@ pub enum LoginOutcome {
 pub enum TwoFactorMethod {
     Authenticator,
     Email,
+    YubiKey,
+    WebAuthn,
+}
+
+impl TwoFactorMethod {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Authenticator => "Application d'authentification",
+            Self::Email => "Code par courriel",
+            Self::YubiKey => "YubiKey (code OTP)",
+            Self::WebAuthn => "Clé de sécurité (USB ou NFC)",
+        }
+    }
 }
 
 /// Type d'élément que l'on peut créer depuis l'application.
@@ -397,10 +441,17 @@ impl Session {
         two_factor: Option<(TwoFactorMethod, String)>,
     ) -> Result<LoginOutcome, Error> {
         let two_factor = two_factor.map(|(method, token)| TwoFactorRequest {
-            token: token.trim().replace(' ', ""),
+            // Les codes saisis peuvent contenir des espaces; la réponse WebAuthn
+            // (JSON) est transmise telle quelle.
+            token: match method {
+                TwoFactorMethod::WebAuthn => token,
+                _ => token.trim().replace(' ', ""),
+            },
             provider: match method {
                 TwoFactorMethod::Authenticator => TwoFactorProvider::Authenticator,
                 TwoFactorMethod::Email => TwoFactorProvider::Email,
+                TwoFactorMethod::YubiKey => TwoFactorProvider::Yubikey,
+                TwoFactorMethod::WebAuthn => TwoFactorProvider::WebAuthn,
             },
             remember: false,
         });
@@ -418,8 +469,10 @@ impl Session {
                 let options = TwoFactorOptions {
                     authenticator: providers.authenticator.is_some(),
                     email: providers.email.is_some(),
+                    yubikey: providers.yubi_key.is_some(),
+                    webauthn: providers.web_authn.is_some(),
                 };
-                if options.authenticator || options.email {
+                if !options.methods().is_empty() {
                     Ok(LoginOutcome::TwoFactorRequired(options))
                 } else {
                     Err(Error::UnsupportedTwoFactor)
@@ -427,6 +480,72 @@ impl Session {
             }
             None => Ok(LoginOutcome::Authenticated),
         }
+    }
+
+    /// Origine du coffre web, inscrite dans le `clientDataJSON` WebAuthn : le
+    /// serveur n'accepte que les signatures produites pour cette origine.
+    pub fn web_origin(&self) -> Result<url::Url, Error> {
+        let origin = match &self.server {
+            Server::BitwardenUs => "https://vault.bitwarden.com".to_owned(),
+            Server::BitwardenEu => "https://vault.bitwarden.eu".to_owned(),
+            Server::SelfHosted(url) => url::Url::parse(url.trim())
+                .map_err(|_| Error::InvalidServerUrl)?
+                .origin()
+                .ascii_serialization(),
+        };
+        url::Url::parse(&origin).map_err(|_| Error::InvalidServerUrl)
+    }
+
+    /// Obtient un défi WebAuthn neuf pour la connexion en deux étapes.
+    ///
+    /// Le SDK ne transmet pas les options WebAuthn reçues du serveur : on refait
+    /// donc la même demande de jeton que lui, sans code 2FA, et on lit
+    /// `TwoFactorProviders2["7"]` dans la réponse. Le serveur remplace à chaque
+    /// fois le défi précédent; c'est celui-ci que vérifiera la connexion suivante.
+    pub async fn webauthn_challenge(&self, password: &str) -> Result<serde_json::Value, Error> {
+        use bitwarden_core::key_management::MasterPasswordAuthenticationData;
+
+        let kdf = self
+            .client
+            .auth()
+            .prelogin(self.email.clone())
+            .await
+            .map_err(|e| Error::Api(e.to_string()))?;
+        let hash = MasterPasswordAuthenticationData::derive(password, &kdf, &self.email)
+            .map_err(|e| Error::Crypto(e.to_string()))?
+            .master_password_authentication_hash
+            .to_string();
+        // Mêmes champs que la requête de connexion du SDK.
+        let body = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("scope", "api offline_access")
+            .append_pair("client_id", "web")
+            .append_pair("deviceType", &(DeviceType::ChromeBrowser as u8).to_string())
+            .append_pair("deviceIdentifier", SDK_LOGIN_DEVICE_ID)
+            .append_pair("deviceName", "firefox")
+            .append_pair("grant_type", "password")
+            .append_pair("username", &self.email)
+            .append_pair("password", &hash)
+            .finish();
+        let config = self.client.internal.get_api_configurations();
+        let identity = &config.identity_config;
+        let text = identity
+            .client
+            .post(format!("{}/connect/token", identity.base_path))
+            .header(
+                "Content-Type",
+                "application/x-www-form-urlencoded; charset=utf-8",
+            )
+            .header("Accept", "application/json")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| Error::Api(e.to_string()))?
+            .text()
+            .await
+            .map_err(|e| Error::Api(e.to_string()))?;
+        let response: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| Error::Api(e.to_string()))?;
+        webauthn_options(&response).ok_or(Error::MissingData("défi WebAuthn"))
     }
 
     /// Demande au serveur d'envoyer le code 2FA par courriel.
@@ -1046,33 +1165,7 @@ mod tests {
 
         crate::runtime().block_on(async {
             // 1. Inscription (clés générées côté client par le SDK).
-            let keys = Client::new(None)
-                .auth()
-                .make_register_keys(email.clone(), password.clone(), Kdf::default_pbkdf2())
-                .unwrap();
-            let body = serde_json::json!({
-                "email": email,
-                "name": "E2E",
-                "kdf": 0,
-                "kdfIterations": 600000,
-                "key": keys.encrypted_user_key.to_string(),
-                "masterPasswordHash": keys.master_password_hash.to_string(),
-                "keys": {
-                    "publicKey": keys.keys.public.to_string(),
-                    "encryptedPrivateKey": keys.keys.private.to_string(),
-                },
-            });
-            let response = reqwest::Client::new()
-                .post(format!("{server_url}/identity/accounts/register"))
-                .json(&body)
-                .send()
-                .await
-                .unwrap();
-            assert!(
-                response.status().is_success(),
-                "inscription : {}",
-                response.text().await.unwrap()
-            );
+            register_account(&server_url, &email, &password).await;
 
             // 2. Mauvais mot de passe, puis connexion, synchro et déverrouillage.
             let mut session = Session::create(&server, device, &email).await.unwrap();
@@ -1201,6 +1294,208 @@ mod tests {
             restored.logout();
             assert!(Session::restore(device).await.is_none());
             eprintln!("parcours complet réussi pour {email}");
+        });
+    }
+
+    /// Crée un compte sur le serveur de test (clés générées par le SDK).
+    async fn register_account(server_url: &str, email: &str, password: &str) {
+        let keys = Client::new(None)
+            .auth()
+            .make_register_keys(email.to_owned(), password.to_owned(), Kdf::default_pbkdf2())
+            .unwrap();
+        let body = serde_json::json!({
+            "email": email,
+            "name": "E2E",
+            "kdf": 0,
+            "kdfIterations": 600000,
+            "key": keys.encrypted_user_key.to_string(),
+            "masterPasswordHash": keys.master_password_hash.to_string(),
+            "keys": {
+                "publicKey": keys.keys.public.to_string(),
+                "encryptedPrivateKey": keys.keys.private.to_string(),
+            },
+        });
+        let response = reqwest::Client::new()
+            .post(format!("{server_url}/identity/accounts/register"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "inscription : {}",
+            response.text().await.unwrap()
+        );
+    }
+
+    /// Clé logicielle empruntée, pour la réutiliser entre enregistrement et connexion.
+    struct Borrowed<'a>(&'a mut webauthn_authenticator_rs::softtoken::SoftToken);
+
+    impl webauthn_authenticator_rs::AuthenticatorBackendHashedClientData for Borrowed<'_> {
+        fn perform_register(
+            &mut self,
+            client_data_hash: Vec<u8>,
+            options: webauthn_rs_proto::PublicKeyCredentialCreationOptions,
+            timeout_ms: u32,
+        ) -> Result<
+            webauthn_rs_proto::RegisterPublicKeyCredential,
+            webauthn_authenticator_rs::prelude::WebauthnCError,
+        > {
+            self.0
+                .perform_register(client_data_hash, options, timeout_ms)
+        }
+
+        fn perform_auth(
+            &mut self,
+            client_data_hash: Vec<u8>,
+            options: webauthn_rs_proto::PublicKeyCredentialRequestOptions,
+            timeout_ms: u32,
+        ) -> Result<
+            webauthn_rs_proto::PublicKeyCredential,
+            webauthn_authenticator_rs::prelude::WebauthnCError,
+        > {
+            self.0.perform_auth(client_data_hash, options, timeout_ms)
+        }
+    }
+
+    /// 2FA par clé de sécurité contre Vaultwarden, avec une clé FIDO2 logicielle
+    /// (même bibliothèque CTAP2 que pour les clés USB/NFC) :
+    /// `COFFRE_E2E_SERVER=http://localhost:8000 cargo test e2e_webauthn -- --ignored`
+    /// (WebAuthn exige https, ou http sur `localhost`.)
+    #[test]
+    #[ignore]
+    fn e2e_webauthn_vaultwarden() {
+        use bitwarden_core::client::persisted_state::AUTHENTICATION_TOKENS;
+        use bitwarden_core::key_management::MasterPasswordAuthenticationData;
+        use webauthn_authenticator_rs::prelude::{
+            CreationChallengeResponse, WebauthnAuthenticator,
+        };
+
+        let Ok(server_url) = std::env::var("COFFRE_E2E_SERVER") else {
+            eprintln!("COFFRE_E2E_SERVER non défini : test ignoré");
+            return;
+        };
+        let server = Server::SelfHosted(server_url.clone());
+        let email = format!("webauthn-{}@exemple.ca", uuid::Uuid::new_v4().simple());
+        let password = "Mot de passe maître très long 123!".to_owned();
+        let device = "11111111-2222-4333-8444-555555555555";
+
+        crate::runtime().block_on(async {
+            register_account(&server_url, &email, &password).await;
+            let session = Session::create(&server, device, &email).await.unwrap();
+            assert!(matches!(
+                session.login(password.clone(), None).await.unwrap(),
+                LoginOutcome::Authenticated
+            ));
+
+            // Activation de la 2FA WebAuthn avec une clé logicielle.
+            let token = session
+                .client
+                .platform()
+                .state()
+                .setting(AUTHENTICATION_TOKENS)
+                .unwrap()
+                .get()
+                .await
+                .unwrap()
+                .unwrap()
+                .access_token;
+            let hash =
+                MasterPasswordAuthenticationData::derive(&password, &Kdf::default_pbkdf2(), &email)
+                    .unwrap()
+                    .master_password_authentication_hash
+                    .to_string();
+            let http = reqwest::Client::new();
+            let creation: serde_json::Value = http
+                .post(format!(
+                    "{server_url}/api/two-factor/get-webauthn-challenge"
+                ))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({ "masterPasswordHash": hash }))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let creation: CreationChallengeResponse =
+                serde_json::from_value(serde_json::json!({ "publicKey": creation })).unwrap();
+            let origin = session.web_origin().unwrap();
+            let (mut soft, _) = webauthn_authenticator_rs::softtoken::SoftToken::new(true).unwrap();
+            let credential = WebauthnAuthenticator::new(Borrowed(&mut soft))
+                .do_registration(origin.clone(), creation)
+                .unwrap();
+            let response = http
+                .put(format!("{server_url}/api/two-factor/webauthn"))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({
+                    "id": 1,
+                    "name": "Clé de test",
+                    "masterPasswordHash": hash,
+                    "deviceResponse": credential,
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                response.status().is_success(),
+                "activation WebAuthn : {}",
+                response.text().await.unwrap()
+            );
+
+            // Nouvelle connexion : la clé de sécurité est exigée.
+            let mut session = Session::create(&server, device, &email).await.unwrap();
+            let options = match session.login(password.clone(), None).await.unwrap() {
+                LoginOutcome::TwoFactorRequired(options) => options,
+                LoginOutcome::Authenticated => panic!("la 2FA aurait dû être exigée"),
+            };
+            assert!(options.webauthn);
+            assert_eq!(options.methods()[0], TwoFactorMethod::WebAuthn);
+
+            // Une clé inconnue est refusée par l'authentificateur…
+            let challenge = session.webauthn_challenge(&password).await.unwrap();
+            let request = crate::security_key::parse_options(challenge).unwrap();
+            let (other, _) = webauthn_authenticator_rs::softtoken::SoftToken::new(true).unwrap();
+            assert!(matches!(
+                crate::security_key::assert_with(other, origin.clone(), request),
+                Err(crate::security_key::KeyError::UnknownCredential)
+                    | Err(crate::security_key::KeyError::Device(_))
+            ));
+
+            // … une assertion falsifiée est refusée par le serveur…
+            let challenge = session.webauthn_challenge(&password).await.unwrap();
+            let request = crate::security_key::parse_options(challenge).unwrap();
+            let assertion =
+                crate::security_key::assert_with(Borrowed(&mut soft), origin.clone(), request)
+                    .unwrap();
+            let forged = assertion.replacen("\"signature\":\"", "\"signature\":\"AAAA", 1);
+            assert!(
+                session
+                    .login(password.clone(), Some((TwoFactorMethod::WebAuthn, forged)))
+                    .await
+                    .is_err()
+            );
+
+            // … et la bonne clé ouvre la session.
+            let challenge = session.webauthn_challenge(&password).await.unwrap();
+            let request = crate::security_key::parse_options(challenge).unwrap();
+            let assertion =
+                crate::security_key::assert_with(Borrowed(&mut soft), origin, request).unwrap();
+            assert!(matches!(
+                session
+                    .login(
+                        password.clone(),
+                        Some((TwoFactorMethod::WebAuthn, assertion))
+                    )
+                    .await
+                    .unwrap(),
+                LoginOutcome::Authenticated
+            ));
+            session.sync().await.unwrap();
+            session.unlock(password.clone()).await.unwrap();
+            assert!(session.is_unlocked());
+            session.logout();
+            eprintln!("2FA WebAuthn réussie pour {email}");
         });
     }
 }

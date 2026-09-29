@@ -1,21 +1,27 @@
 # Contributor: Octopus AI <334834969+octopus-ai-ca@users.noreply.github.com>
 # Maintainer: Octopus AI <334834969+octopus-ai-ca@users.noreply.github.com>
 pkgname=coffre
-pkgver=0.2.1
+pkgver=0.3.0
 pkgrel=0
 pkgdesc="Client Bitwarden adaptatif pour Phosh (GTK4/libadwaita)"
 url="https://github.com/octopus-ai-ca/bitwarden-phosh"
 # Le SDK Bitwarden n'est testé que sur ces architectures 64 bits.
 arch="aarch64 x86_64"
 license="GPL-3.0-only"
-# Certificats racines lus par rustls-platform-verifier (appels HTTPS du SDK).
-depends="ca-certificates-bundle"
+# Certificats racines lus par rustls-platform-verifier (appels HTTPS du SDK) ;
+# règles udev donnant à l'utilisateur connecté l'accès aux clés FIDO2 USB (hidraw).
+depends="ca-certificates-bundle libfido2-udev"
 makedepends="
 	cargo
 	cargo-auditable
+	clang-libclang
 	cmake
+	eudev-dev
 	gtk4.0-dev
 	libadwaita-dev
+	linux-headers
+	openssl-dev
+	pcsc-lite-dev
 	perl
 	"
 # Le SDK officiel est une dépendance Git : `cargo fetch` a besoin du réseau.
@@ -46,5 +52,5 @@ package() {
 }
 
 sha512sums="
-SKIP  coffre-0.2.1.tar.gz
+SKIP  coffre-0.3.0.tar.gz
 "

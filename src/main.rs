@@ -2,6 +2,7 @@
 
 mod backend;
 mod config;
+mod security_key;
 mod ui;
 
 use adw::prelude::*;
