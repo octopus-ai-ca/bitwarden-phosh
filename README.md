@@ -40,10 +40,11 @@ seule) ne sont pas utilisées. Le SDK n'étant pas publié sur crates.io, il est
 - Le presse-papier est vidé 30 secondes après une copie.
 - La déconnexion efface toutes les données locales.
 
-## Fonctionnalités (v0.2)
+## Fonctionnalités (v0.3)
 
 - [x] Connexion par mot de passe maître (bitwarden.com, .eu, auto-hébergé)
-- [x] 2FA : application d'authentification ou courriel
+- [x] 2FA : application d'authentification, courriel, **clé de sécurité FIDO2 (USB ou NFC)**
+  et **YubiKey OTP (USB)**
 - [x] Session conservée et coffre consultable hors ligne
 - [x] Déverrouillage par NIP
 - [x] Liste, recherche et détail (identifiant, mot de passe, TOTP, sites, carte, champs, notes)
@@ -52,10 +53,33 @@ seule) ne sont pas utilisées. Le SDK n'étant pas publié sur crates.io, il est
 - [x] Copie avec effacement automatique du presse-papier
 - [x] Verrouillage automatique et manuel
 
-Limites connues : pas de SSO, WebAuthn, YubiKey ni Duo ; l'option « se souvenir de cet
+Limites connues : pas de SSO ni Duo ; l'option « se souvenir de cet
 appareil » de la 2FA n'est pas exposée par le SDK (la 2FA n'est toutefois demandée qu'à
 la première connexion) ; seuls les identifiants et les notes sécurisées sont modifiables ;
 pas de pièces jointes ni de dossiers.
+
+## Clés de sécurité (2FA)
+
+| Méthode | USB | NFC |
+|---|---|---|
+| Clé FIDO2 / WebAuthn (YubiKey 5, SoloKey, Nitrokey, Google Titan…) | ✅ | ✅ par lecteur PC/SC |
+| YubiKey OTP (code de 44 caractères) | ✅ la clé saisit le code | ❌ |
+
+- **USB** : brancher la clé au port USB-C (OTG) du téléphone, puis la toucher quand elle
+  clignote. Le paquet dépend de `libfido2-udev`, dont les règles udev donnent l'accès
+  aux clés à l'utilisateur connecté. Si la clé n'est pas détectée (système sans logind),
+  ajouter l'utilisateur au groupe `plugdev` : `doas adduser $USER plugdev`, puis se
+  reconnecter.
+- **NFC** : passe par PC/SC (`pcscd`). Installer `doas apk add pcsc-lite ccid`, puis
+  `doas rc-update add pcscd && doas rc-service pcscd start` (ou
+  `systemctl enable --now pcscd`). Fonctionne avec les lecteurs NFC reconnus par PC/SC
+  (ACR122U, etc.). **La puce NFC intégrée des téléphones Linux n'est généralement pas
+  exposée par PC/SC** : elle n'est donc pas prise en charge pour l'instant.
+- Si la clé exige un NIP FIDO2, Coffre le demande.
+- WebAuthn exige une adresse de serveur en `https://` (ou `http://localhost`). La
+  signature est produite pour l'origine du coffre web : `https://vault.bitwarden.com`,
+  `https://vault.bitwarden.eu` ou l'adresse du serveur auto-hébergé (`DOMAIN` de
+  Vaultwarden).
 
 ## Installation sur postmarketOS
 
@@ -63,10 +87,10 @@ Paquet natif pour **postmarketOS v26.06** (Alpine 3.24) et edge, sur aarch64 (t�
 ou x86_64. Depuis la [page des publications](https://github.com/octopus-ai-ca/bitwarden-phosh/releases) :
 
 ```sh
-wget https://github.com/octopus-ai-ca/bitwarden-phosh/releases/download/v0.2.1/coffre-0.2.1-r0-aarch64.apk
-wget https://github.com/octopus-ai-ca/bitwarden-phosh/releases/download/v0.2.1/coffre-aarch64.apk.sha256
+wget https://github.com/octopus-ai-ca/bitwarden-phosh/releases/download/v0.3.0/coffre-0.3.0-r0-aarch64.apk
+wget https://github.com/octopus-ai-ca/bitwarden-phosh/releases/download/v0.3.0/coffre-aarch64.apk.sha256
 sha256sum -c coffre-aarch64.apk.sha256
-doas apk add --allow-untrusted ./coffre-0.2.1-r0-aarch64.apk
+doas apk add --allow-untrusted ./coffre-0.3.0-r0-aarch64.apk
 ```
 
 `--allow-untrusted` est nécessaire, car le paquet est signé par une clé propre à chaque
@@ -81,7 +105,7 @@ Sur le téléphone (ou dans `pmbootstrap chroot`), avec l'APKBUILD de la publica
 doas apk add alpine-sdk
 abuild-keygen -a -i
 mkdir coffre && cd coffre
-wget https://github.com/octopus-ai-ca/bitwarden-phosh/releases/download/v0.2.1/APKBUILD
+wget https://github.com/octopus-ai-ca/bitwarden-phosh/releases/download/v0.3.0/APKBUILD
 abuild -r
 ```
 
@@ -96,7 +120,7 @@ leur rustc est trop ancien pour gtk-rs 0.11.
 
 ### Autres distributions (glibc)
 
-Les archives `coffre-v0.2.1-linux-glibc-*.tar.gz` visent Debian, Ubuntu ou Fedora (GTK
+Les archives `coffre-v0.3.0-linux-glibc-*.tar.gz` visent Debian, Ubuntu ou Fedora (GTK
 4.14+ et libadwaita 1.5+) : extraire puis lancer `install.sh`.
 
 ## Compilation
@@ -104,7 +128,8 @@ Les archives `coffre-v0.2.1-linux-glibc-*.tar.gz` visent Debian, Ubuntu ou Fedor
 Dépendances (Debian/Mobian/Ubuntu) :
 
 ```sh
-sudo apt install build-essential pkg-config libgtk-4-dev libadwaita-1-dev
+sudo apt install build-essential pkg-config libgtk-4-dev libadwaita-1-dev \
+    libudev-dev libpcsclite-dev libclang-dev
 ```
 
 Rust 1.92 ou plus récent est requis (exigences de gtk-rs 0.11 et du SDK).
@@ -114,7 +139,8 @@ cargo run            # développement
 cargo test           # tests unitaires
 cargo test -- --ignored   # test réseau réel contre bitwarden.com
 # parcours complet contre un Vaultwarden local :
-COFFRE_E2E_SERVER=http://127.0.0.1:8000 cargo test e2e -- --ignored
+# (DOMAIN=http://localhost:8000 côté Vaultwarden pour le test WebAuthn)
+COFFRE_E2E_SERVER=http://localhost:8000 cargo test e2e -- --ignored --test-threads=1
 ```
 
 ## Structure
@@ -124,9 +150,11 @@ src/
 ├── main.rs        Point d'entrée, pont Tokio ↔ boucle GLib
 ├── backend.rs     Session SDK : connexion, 2FA, synchro, (dé)verrouillage, déchiffrement
 ├── config.rs      Préférences non sensibles
+├── security_key.rs Clés FIDO2 (CTAP2) par USB ou NFC
 └── ui/
     ├── mod.rs     Fenêtre, navigation, verrouillage auto, presse-papier
-    ├── login.rs   Connexion, 2FA, déverrouillage (mot de passe ou NIP)
+    ├── login.rs   Connexion, déverrouillage (mot de passe ou NIP)
+    ├── two_factor.rs  Connexion en deux étapes (code, YubiKey, clé FIDO2)
     ├── vault.rs   Liste et recherche
     ├── detail.rs  Détail d'un élément
     └── edit.rs    Création et modification

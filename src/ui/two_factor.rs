@@ -22,6 +22,9 @@ struct Page {
     password: String,
     method: Cell<TwoFactorMethod>,
     status: adw::StatusPage,
+    /// Groupe (choix de méthode, code), masqué s'il n'a rien à montrer.
+    group: adw::PreferencesGroup,
+    several_methods: bool,
     code_row: adw::EntryRow,
     submit: gtk::Button,
     email_button: gtk::Button,
@@ -90,6 +93,8 @@ pub fn two_factor_page(
         password,
         method: Cell::new(methods[0]),
         status,
+        group,
+        several_methods: methods.len() > 1,
         code_row,
         submit,
         email_button,
@@ -150,6 +155,7 @@ impl Page {
         self.method.set(method);
         let uses_code = method != TwoFactorMethod::WebAuthn;
         self.code_row.set_visible(uses_code);
+        self.group.set_visible(uses_code || self.several_methods);
         self.submit.set_visible(uses_code);
         self.key_box.set_visible(!uses_code);
         self.email_button

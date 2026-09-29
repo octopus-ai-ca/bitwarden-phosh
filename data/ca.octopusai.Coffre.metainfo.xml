@@ -13,7 +13,7 @@
     </p>
     <ul>
       <li>Connexion à bitwarden.com, bitwarden.eu ou à un serveur auto-hébergé</li>
-      <li>Connexion en deux étapes par application d'authentification ou par courriel</li>
+      <li>Connexion en deux étapes par application d'authentification, courriel, clé de sécurité FIDO2 (USB ou NFC) ou YubiKey</li>
       <li>Coffre consultable hors ligne et session conservée entre les lancements</li>
       <li>Déverrouillage par NIP</li>
       <li>Création et modification d'identifiants et de notes sécurisées</li>
@@ -35,6 +35,11 @@
     <control>pointing</control>
   </supports>
   <releases>
+    <release version="0.3.0" date="2026-09-29">
+      <description>
+        <p>Connexion en deux étapes par clé de sécurité FIDO2 (USB ou NFC) et YubiKey OTP.</p>
+      </description>
+    </release>
     <release version="0.2.1" date="2026-09-29">
       <description>
         <p>Paquet natif postmarketOS ; retrait du Flatpak.</p>

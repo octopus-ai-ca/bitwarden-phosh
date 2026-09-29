@@ -3,6 +3,15 @@
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et le projet
 respecte le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [0.3.0] - 2026-09-29
+
+### Ajouté
+- Connexion en deux étapes par **clé de sécurité FIDO2 / WebAuthn**, par USB (hidraw) ou
+  par NFC (lecteurs PC/SC), avec demande du NIP de la clé au besoin.
+- Connexion en deux étapes par **YubiKey OTP** (la clé saisit le code par USB).
+- Choix de la méthode lorsque le compte en propose plusieurs.
+- Le paquet postmarketOS dépend de `libfido2-udev` (accès aux clés USB).
+
 ## [0.2.1] - 2026-09-29
 
 ### Ajouté
@@ -39,5 +48,6 @@ Première version publiée.
 - Interface adaptative GTK4/libadwaita pour Phosh et GNOME ; paquet Flatpak et
   binaires x86_64 et aarch64.
 
+[0.3.0]: https://github.com/octopus-ai-ca/bitwarden-phosh/releases/tag/v0.3.0
 [0.2.1]: https://github.com/octopus-ai-ca/bitwarden-phosh/releases/tag/v0.2.1
 [0.2.0]: https://github.com/octopus-ai-ca/bitwarden-phosh/releases/tag/v0.2.0
