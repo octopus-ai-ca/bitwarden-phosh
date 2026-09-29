@@ -1,0 +1,39 @@
+{
+  "id": "ca.octopusai.Coffre",
+  "runtime": "org.gnome.Platform",
+  "runtime-version": "48",
+  "sdk": "org.gnome.Sdk",
+  "sdk-extensions": ["org.freedesktop.Sdk.Extension.rust-stable"],
+  "command": "coffre",
+  "finish-args": [
+    "--share=network",
+    "--share=ipc",
+    "--socket=wayland",
+    "--socket=fallback-x11",
+    "--device=dri"
+  ],
+  "build-options": {
+    "append-path": "/usr/lib/sdk/rust-stable/bin",
+    "env": {
+      "CARGO_HOME": "/run/build/coffre/cargo",
+      "CARGO_NET_OFFLINE": "true"
+    }
+  },
+  "modules": [
+    {
+      "name": "coffre",
+      "buildsystem": "simple",
+      "build-commands": [
+        "cargo --offline build --release --locked",
+        "install -Dm755 target/release/coffre /app/bin/coffre",
+        "install -Dm644 data/ca.octopusai.Coffre.desktop /app/share/applications/ca.octopusai.Coffre.desktop",
+        "install -Dm644 data/ca.octopusai.Coffre.metainfo.xml /app/share/metainfo/ca.octopusai.Coffre.metainfo.xml",
+        "install -Dm644 data/icons/hicolor/scalable/apps/ca.octopusai.Coffre.svg /app/share/icons/hicolor/scalable/apps/ca.octopusai.Coffre.svg"
+      ],
+      "sources": [
+        { "type": "dir", "path": ".." },
+        "cargo-sources.json"
+      ]
+    }
+  ]
+}

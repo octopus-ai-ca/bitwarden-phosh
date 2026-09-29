@@ -1,16 +1,38 @@
 [package]
 name = "coffre"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.85"
+edition = "2024"
+rust-version = "1.88"
 description = "Client Bitwarden adaptatif pour Phosh (GTK4/libadwaita)"
-license = "GPL-3.0-or-later"
+license = "GPL-3.0-only"
 publish = false
+
+# SDK officiel Bitwarden, utilisé sous l'option GPL-3.0 de sa double licence.
+# Les crates de `bitwarden_license/` (licence SDK seule) ne sont pas utilisées.
+[dependencies.bitwarden-core]
+git = "https://github.com/bitwarden/sdk-internal.git"
+rev = "57446279c2a91208d352fac6977c7a15212c3fcb"
+features = ["internal"]
+
+[dependencies.bitwarden-auth]
+git = "https://github.com/bitwarden/sdk-internal.git"
+rev = "57446279c2a91208d352fac6977c7a15212c3fcb"
+
+[dependencies.bitwarden-crypto]
+git = "https://github.com/bitwarden/sdk-internal.git"
+rev = "57446279c2a91208d352fac6977c7a15212c3fcb"
+
+[dependencies.bitwarden-vault]
+git = "https://github.com/bitwarden/sdk-internal.git"
+rev = "57446279c2a91208d352fac6977c7a15212c3fcb"
+
+[dependencies.bitwarden-api-api]
+git = "https://github.com/bitwarden/sdk-internal.git"
+rev = "57446279c2a91208d352fac6977c7a15212c3fcb"
 
 [dependencies]
 adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
 gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
-rbw = "1.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

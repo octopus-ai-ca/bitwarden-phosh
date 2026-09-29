@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Coffre
+GenericName=Gestionnaire de mots de passe
+Comment=Client Bitwarden pour Phosh et GNOME
+Exec=coffre
+Icon=ca.octopusai.Coffre
+Terminal=false
+Categories=Utility;Security;GTK;
+Keywords=bitwarden;vaultwarden;mot de passe;password;coffre;
+StartupNotify=true
+X-Purism-FormFactor=Workstation;Mobile;

@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>ca.octopusai.Coffre</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+  <name>Coffre</name>
+  <summary>Client Bitwarden pour Phosh et GNOME</summary>
+  <description>
+    <p>
+      Coffre est un client non officiel pour les serveurs Bitwarden et Vaultwarden,
+      conçu pour les téléphones Linux (Phosh) comme pour le bureau GNOME.
+      Il repose sur le SDK officiel de Bitwarden pour l'authentification et le chiffrement.
+    </p>
+    <ul>
+      <li>Connexion à bitwarden.com, bitwarden.eu ou à un serveur auto-hébergé</li>
+      <li>Connexion en deux étapes par application d'authentification ou par courriel</li>
+      <li>Recherche, copie sécurisée et codes TOTP</li>
+      <li>Verrouillage automatique après inactivité</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">ca.octopusai.Coffre.desktop</launchable>
+  <developer id="ca.octopusai">
+    <name>Octopus AI</name>
+  </developer>
+  <content_rating type="oars-1.1"/>
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <supports>
+    <control>touch</control>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </supports>
+  <releases>
+    <release version="0.1.0" date="2026-09-29">
+      <description>
+        <p>Premier jalon : connexion, synchronisation, consultation du coffre en lecture seule.</p>
+      </description>
+    </release>
+  </releases>
+</component>
