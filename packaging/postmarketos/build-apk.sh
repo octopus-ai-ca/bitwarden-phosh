@@ -12,7 +12,9 @@ out="$src/dist"
 pkgver=$(sed -n 's/^pkgver=//p' "$src/packaging/postmarketos/APKBUILD")
 tarball="coffre-$pkgver.tar.gz"
 
-apk add --no-cache alpine-sdk sudo git
+# abuild installe ensuite les dépendances de compilation : l'index doit rester en cache.
+apk update
+apk add alpine-sdk sudo git
 adduser -D builder
 addgroup builder abuild
 echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
