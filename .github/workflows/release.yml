@@ -3,9 +3,18 @@ name: Publication
 on:
   push:
     tags: ["v*"]
+  # Publication manuelle : crée l'étiquette `version` sur le commit choisi.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Étiquette à publier (ex. v0.2.0)"
+        required: true
 
 permissions:
   contents: write
+
+env:
+  TAG: ${{ inputs.version || github.ref_name }}
 
 jobs:
   binaires:
@@ -27,7 +36,7 @@ jobs:
       - run: cargo build --release --locked
       - name: Archive
         run: |
-          name=coffre-${GITHUB_REF_NAME}-linux-${{ matrix.arch }}
+          name=coffre-${TAG}-linux-${{ matrix.arch }}
           mkdir -p "$name"
           cp target/release/coffre "$name/"
           cp -r data LICENSE README.md install.sh "$name/"
@@ -69,7 +78,8 @@ jobs:
           path: artefacts
       - name: Notes de version
         run: |
-          version=${GITHUB_REF_NAME#v}
+          version=${TAG#v}
+          test -n "$version"
           awk -v v="$version" '
             $0 ~ "^## \\[" v "\\]" { on = 1; next }
             on && /^## \[/ { exit }
@@ -78,8 +88,11 @@ jobs:
           cat notes.md
       - uses: softprops/action-gh-release@v2
         with:
-          name: Coffre ${{ github.ref_name }}
+          name: Coffre ${{ env.TAG }}
+          tag_name: ${{ env.TAG }}
+          target_commitish: ${{ github.sha }}
           body_path: notes.md
+          fail_on_unmatched_files: true
           files: |
             artefacts/**/*.tar.gz
             artefacts/**/*.sha256
