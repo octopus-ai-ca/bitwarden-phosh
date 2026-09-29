@@ -109,8 +109,22 @@ impl App {
         self.window.present();
     }
 
+    /// Affiche un message; il passe à la ligne au lieu d'être tronqué sur un
+    /// écran de téléphone.
     pub fn toast(&self, message: &str) {
-        self.toasts.add_toast(adw::Toast::new(message));
+        let label = gtk::Label::builder()
+            .label(message)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .justify(gtk::Justification::Center)
+            .width_chars(28)
+            .max_width_chars(40)
+            .build();
+        let toast = adw::Toast::builder()
+            .custom_title(&label)
+            .timeout(if message.len() > 40 { 8 } else { 5 })
+            .build();
+        self.toasts.add_toast(toast);
     }
 
     fn setup_actions(&self) {

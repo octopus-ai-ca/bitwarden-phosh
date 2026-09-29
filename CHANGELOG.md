@@ -13,6 +13,8 @@ respecte le [versionnage sémantique](https://semver.org/lang/fr/).
 - Paquet Flatpak.
 
 ### Modifié
+- Les messages d'information passent à la ligne au lieu d'être tronqués sur un écran de
+  téléphone.
 - Les archives binaires sont renommées `linux-glibc` : elles visent Debian, Ubuntu ou
   Fedora et ne fonctionnent pas sur postmarketOS (musl).
 
