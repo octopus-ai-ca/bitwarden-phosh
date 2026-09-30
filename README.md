@@ -40,7 +40,7 @@ seule) ne sont pas utilisées. Le SDK n'étant pas publié sur crates.io, il est
 - Le presse-papier est vidé 30 secondes après une copie.
 - La déconnexion efface toutes les données locales.
 
-## Fonctionnalités (v0.3)
+## Fonctionnalités (v0.4)
 
 - [x] Connexion par mot de passe maître (bitwarden.com, .eu, auto-hébergé)
 - [x] 2FA : application d'authentification, courriel, **clé de sécurité FIDO2 (USB ou NFC)**
@@ -62,7 +62,7 @@ pas de pièces jointes ni de dossiers.
 
 | Méthode | USB | NFC |
 |---|---|---|
-| Clé FIDO2 / WebAuthn (YubiKey 5, SoloKey, Nitrokey, Google Titan…) | ✅ | ✅ par lecteur PC/SC |
+| Clé FIDO2 / WebAuthn (YubiKey 5, SoloKey, Nitrokey, Google Titan…) | ✅ | ✅ lecteur PC/SC, ou puce intégrée par démon NCI |
 | YubiKey OTP (code de 44 caractères) | ✅ la clé saisit le code | ❌ |
 
 - **USB** : brancher la clé au port USB-C (OTG) du téléphone, puis la toucher quand elle
@@ -70,11 +70,17 @@ pas de pièces jointes ni de dossiers.
   aux clés à l'utilisateur connecté. Si la clé n'est pas détectée (système sans logind),
   ajouter l'utilisateur au groupe `plugdev` : `doas adduser $USER plugdev`, puis se
   reconnecter.
-- **NFC** : passe par PC/SC (`pcscd`). Installer `doas apk add pcsc-lite ccid`, puis
+- **NFC, lecteur PC/SC** : installer `doas apk add pcsc-lite ccid`, puis
   `doas rc-update add pcscd && doas rc-service pcscd start` (ou
   `systemctl enable --now pcscd`). Fonctionne avec les lecteurs NFC reconnus par PC/SC
-  (ACR122U, etc.). **La puce NFC intégrée des téléphones Linux n'est généralement pas
-  exposée par PC/SC** : elle n'est donc pas prise en charge pour l'instant.
+  (ACR122U, etc.).
+- **NFC, puce intégrée du téléphone** : la puce NFC des téléphones Linux n'est pas
+  exposée par PC/SC. **Sans `pcscd`, Coffre se replie automatiquement** sur le socket
+  d'un démon NFC qui relaie les trames NCI (`/run/a5y17lte-nfc/nci.sock`, ou
+  `COFFRE_NCI_SOCKET`) et pilote lui-même l'activation ISO-DEP et CTAP-sur-NFC. Le
+  relais à intégrer au démon, son protocole et le guide pour le Galaxy A5 2017
+  (`a5y17lte-nfcd`) sont dans [`contrib/nci-bridge/`](contrib/nci-bridge/README.md).
+  L'utilisateur doit être membre du groupe `nfc`.
 - Si la clé exige un NIP FIDO2, Coffre le demande.
 - WebAuthn exige une adresse de serveur en `https://` (ou `http://localhost`). La
   signature est produite pour l'origine du coffre web : `https://vault.bitwarden.com`,
@@ -87,10 +93,10 @@ Paquet natif pour **postmarketOS v26.06** (Alpine 3.24) et edge, sur aarch64 (t�
 ou x86_64. Depuis la [page des publications](https://github.com/octopus-ai-ca/bitwarden-phosh/releases) :
 
 ```sh
-wget https://github.com/octopus-ai-ca/bitwarden-phosh/releases/download/v0.3.0/coffre-0.3.0-r0-aarch64.apk
-wget https://github.com/octopus-ai-ca/bitwarden-phosh/releases/download/v0.3.0/coffre-aarch64.apk.sha256
+wget https://github.com/octopus-ai-ca/bitwarden-phosh/releases/download/v0.4.0/coffre-0.4.0-r0-aarch64.apk
+wget https://github.com/octopus-ai-ca/bitwarden-phosh/releases/download/v0.4.0/coffre-aarch64.apk.sha256
 sha256sum -c coffre-aarch64.apk.sha256
-doas apk add --allow-untrusted ./coffre-0.3.0-r0-aarch64.apk
+doas apk add --allow-untrusted ./coffre-0.4.0-r0-aarch64.apk
 ```
 
 `--allow-untrusted` est nécessaire, car le paquet est signé par une clé propre à chaque
@@ -105,7 +111,7 @@ Sur le téléphone (ou dans `pmbootstrap chroot`), avec l'APKBUILD de la publica
 doas apk add alpine-sdk
 abuild-keygen -a -i
 mkdir coffre && cd coffre
-wget https://github.com/octopus-ai-ca/bitwarden-phosh/releases/download/v0.3.0/APKBUILD
+wget https://github.com/octopus-ai-ca/bitwarden-phosh/releases/download/v0.4.0/APKBUILD
 abuild -r
 ```
 
@@ -120,7 +126,7 @@ leur rustc est trop ancien pour gtk-rs 0.11.
 
 ### Autres distributions (glibc)
 
-Les archives `coffre-v0.3.0-linux-glibc-*.tar.gz` visent Debian, Ubuntu ou Fedora (GTK
+Les archives `coffre-v0.4.0-linux-glibc-*.tar.gz` visent Debian, Ubuntu ou Fedora (GTK
 4.14+ et libadwaita 1.5+) : extraire puis lancer `install.sh`.
 
 ## Compilation
@@ -141,6 +147,9 @@ cargo test -- --ignored   # test réseau réel contre bitwarden.com
 # parcours complet contre un Vaultwarden local :
 # (DOMAIN=http://localhost:8000 côté Vaultwarden pour le test WebAuthn)
 COFFRE_E2E_SERVER=http://localhost:8000 cargo test e2e -- --ignored --test-threads=1
+# relais NCI (C) et parcours Coffre → relais → contrôleur NFC simulé :
+make -C contrib/nci-bridge check
+COFFRE_NCI_BRIDGE=contrib/nci-bridge/test_nci_bridge cargo test pont_c -- --ignored
 ```
 
 ## Structure
@@ -150,7 +159,8 @@ src/
 ├── main.rs        Point d'entrée, pont Tokio ↔ boucle GLib
 ├── backend.rs     Session SDK : connexion, 2FA, synchro, (dé)verrouillage, déchiffrement
 ├── config.rs      Préférences non sensibles
-├── security_key.rs Clés FIDO2 (CTAP2) par USB ou NFC
+├── security_key.rs Clés FIDO2 (CTAP2) par USB ou NFC, repli NCI sans pcscd
+├── nfc_nci.rs     NCI ISO-DEP et CTAP-sur-NFC par le démon de la puce intégrée
 └── ui/
     ├── mod.rs     Fenêtre, navigation, verrouillage auto, presse-papier
     ├── login.rs   Connexion, déverrouillage (mot de passe ou NIP)
@@ -160,5 +170,6 @@ src/
     └── edit.rs    Création et modification
 data/              .desktop, metainfo, icône
 packaging/         APKBUILD postmarketOS et script de compilation Alpine
+contrib/nci-bridge/ Relais NCI (C) à intégrer au démon NFC du téléphone
 .github/workflows/ CI et publication (.apk postmarketOS + binaires glibc, x86_64 et aarch64)
 ```

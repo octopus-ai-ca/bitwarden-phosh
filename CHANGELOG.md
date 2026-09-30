@@ -3,6 +3,16 @@
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et le projet
 respecte le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [0.4.0] - 2026-09-30
+
+### Ajouté
+- Clé FIDO2 par la **puce NFC intégrée** du téléphone, en repli automatique lorsque
+  `pcscd` est absent : Coffre dialogue en NCI (activation ISO-DEP, fragmentation,
+  crédits) avec le démon NFC par un socket Unix, puis en CTAP-sur-NFC avec la clé.
+- `contrib/nci-bridge/` : relais NCI en C à intégrer au démon qui détient le contrôleur
+  (liste blanche des commandes, un client à la fois), avec guide pour le Galaxy A5 2017
+  (`a5y17lte-nfcd`, HAL Samsung `sec-nfc`).
+
 ## [0.3.0] - 2026-09-29
 
 ### Ajouté
@@ -48,6 +58,7 @@ Première version publiée.
 - Interface adaptative GTK4/libadwaita pour Phosh et GNOME ; paquet Flatpak et
   binaires x86_64 et aarch64.
 
+[0.4.0]: https://github.com/octopus-ai-ca/bitwarden-phosh/releases/tag/v0.4.0
 [0.3.0]: https://github.com/octopus-ai-ca/bitwarden-phosh/releases/tag/v0.3.0
 [0.2.1]: https://github.com/octopus-ai-ca/bitwarden-phosh/releases/tag/v0.2.1
 [0.2.0]: https://github.com/octopus-ai-ca/bitwarden-phosh/releases/tag/v0.2.0

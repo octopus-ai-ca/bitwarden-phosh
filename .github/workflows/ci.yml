@@ -22,6 +22,11 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      - name: Relais NCI (C, avec sanitizers) et parcours Coffre → relais
+        run: |
+          make -C contrib/nci-bridge check CFLAGS="-O1 -g -fsanitize=address,undefined"
+          make -C contrib/nci-bridge clean test_nci_bridge
+          COFFRE_NCI_BRIDGE=contrib/nci-bridge/test_nci_bridge cargo test --locked pont_c -- --ignored
 
   # Paquet natif postmarketOS (Alpine 3.24 = postmarketOS v26.06), compilé
   # dans un conteneur lancé à la main : les actions JavaScript ne tournent pas

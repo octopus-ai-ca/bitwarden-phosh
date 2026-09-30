@@ -1,7 +1,7 @@
 # Contributor: Octopus AI <334834969+octopus-ai-ca@users.noreply.github.com>
 # Maintainer: Octopus AI <334834969+octopus-ai-ca@users.noreply.github.com>
 pkgname=coffre
-pkgver=0.3.0
+pkgver=0.4.0
 pkgrel=0
 pkgdesc="Client Bitwarden adaptatif pour Phosh (GTK4/libadwaita)"
 url="https://github.com/octopus-ai-ca/bitwarden-phosh"
@@ -52,5 +52,5 @@ package() {
 }
 
 sha512sums="
-SKIP  coffre-0.3.0.tar.gz
+SKIP  coffre-0.4.0.tar.gz
 "

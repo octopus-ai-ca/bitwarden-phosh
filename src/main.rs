@@ -2,6 +2,7 @@
 
 mod backend;
 mod config;
+mod nfc_nci;
 mod security_key;
 mod ui;
 
