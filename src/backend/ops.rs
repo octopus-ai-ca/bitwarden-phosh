@@ -570,7 +570,7 @@ impl Session {
                 has_password: view.has_password,
             });
         }
-        out.sort_by(|a, b| b.deletion_date.cmp(&a.deletion_date));
+        out.sort_by_key(|send| std::cmp::Reverse(send.deletion_date));
         Ok(out)
     }
 
@@ -642,11 +642,7 @@ impl Session {
                 current: d.identifier.as_deref() == Some(super::SDK_LOGIN_DEVICE_ID),
             })
             .collect();
-        devices.sort_by(|a, b| {
-            b.current
-                .cmp(&a.current)
-                .then(b.first_login.cmp(&a.first_login))
-        });
+        devices.sort_by_key(|d| std::cmp::Reverse((d.current, d.first_login)));
         Ok(devices)
     }
 
