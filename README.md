@@ -6,6 +6,10 @@ GTK4 et libadwaita. Compatible avec **bitwarden.com**, **bitwarden.eu** et les s
 
 > Projet non officiel, sans lien avec Bitwarden Inc.
 
+| Connexion | Coffre | Générateur | Paramètres |
+|---|---|---|---|
+| ![Connexion](docs/captures/accueil.png) | ![Coffre](docs/captures/coffre.png) | ![Générateur](docs/captures/generateur.png) | ![Paramètres](docs/captures/parametres.png) |
+
 ## Architecture
 
 | Couche | Technologie |
@@ -33,30 +37,35 @@ seule) ne sont pas utilisées. Le SDK n'étant pas publié sur crates.io, il est
 - Cette base contient aussi les jetons d'accès et de rafraîchissement (comme le CLI
   officiel) : ils permettent de synchroniser, mais pas de déchiffrer le coffre sans le
   mot de passe maître.
-- Verrouillage automatique après 5 minutes d'inactivité ; au redémarrage, l'application
+- Expiration de la session après 5 minutes d'inactivité par défaut (délai et action,
+  verrouiller ou se déconnecter, réglables) ; au redémarrage, l'application
   s'ouvre verrouillée et se déverrouille localement, sans réseau.
 - Le NIP n'est gardé qu'en mémoire (oublié à la fermeture) et désactivé après 5 essais
   infructueux, comme l'option par défaut des clients officiels.
-- Le presse-papier est vidé 30 secondes après une copie.
+- Le presse-papier est vidé 30 secondes après une copie (délai réglable).
 - La déconnexion efface toutes les données locales.
 
-## Fonctionnalités (v0.4)
+## Fonctionnalités (v0.5)
 
 - [x] Connexion par mot de passe maître (bitwarden.com, .eu, auto-hébergé)
 - [x] 2FA : application d'authentification, courriel, **clé de sécurité FIDO2 (USB ou NFC)**
   et **YubiKey OTP (USB)**
-- [x] Session conservée et coffre consultable hors ligne
-- [x] Déverrouillage par NIP
-- [x] Liste, recherche et détail (identifiant, mot de passe, TOTP, sites, carte, champs, notes)
-- [x] Création et modification d'identifiants et de notes sécurisées
-- [x] Générateur de mots de passe, historique des mots de passe, corbeille
-- [x] Copie avec effacement automatique du presse-papier
-- [x] Verrouillage automatique et manuel
+- [x] Session conservée et coffre consultable hors ligne ; déverrouillage par NIP
+- [x] Interface à onglets (Coffre, Générateur, Send, Paramètres), inspirée de
+  l'extension Bitwarden
+- [x] Coffre : recherche, filtres par dossier et par type, favoris, icônes des sites,
+  copie rapide, archive, corbeille (restauration, suppression définitive)
+- [x] Création et modification d'identifiants et de notes sécurisées (dossier, favori)
+- [x] Dossiers, import (Bitwarden JSON, KeePass) et export (JSON, CSV, JSON protégé)
+- [x] Générateur de mots de passe, de phrases de passe et de noms d'utilisateur
+- [x] Send texte (lien, durée, nombre d'accès, mot de passe)
+- [x] Appareils du compte, phrase d'empreinte
+- [x] Thème clair ou sombre, mode compact, délais d'expiration et du presse-papier
 
 Limites connues : pas de SSO ni Duo ; l'option « se souvenir de cet
 appareil » de la 2FA n'est pas exposée par le SDK (la 2FA n'est toutefois demandée qu'à
 la première connexion) ; seuls les identifiants et les notes sécurisées sont modifiables ;
-pas de pièces jointes ni de dossiers.
+pas de pièces jointes ni de Send de fichier.
 
 ## Clés de sécurité (2FA)
 
@@ -81,7 +90,8 @@ pas de pièces jointes ni de dossiers.
   relais à intégrer au démon, son protocole et le guide pour le Galaxy A5 2017
   (`a5y17lte-nfcd`) sont dans [`contrib/nci-bridge/`](contrib/nci-bridge/README.md).
   L'utilisateur doit être membre du groupe `nfc`.
-- Si la clé exige un NIP FIDO2, Coffre le demande.
+- Si la clé exige un NIP FIDO2, Coffre le demande. Si la clé quitte le champ NFC après
+  la saisie du NIP, Coffre réessaie chaque seconde pendant 5 secondes.
 - WebAuthn exige une adresse de serveur en `https://` (ou `http://localhost`). La
   signature est produite pour l'origine du coffre web : `https://vault.bitwarden.com`,
   `https://vault.bitwarden.eu` ou l'adresse du serveur auto-hébergé (`DOMAIN` de
@@ -93,10 +103,10 @@ Paquet natif pour **postmarketOS v26.06** (Alpine 3.24) et edge, sur aarch64 (t�
 ou x86_64. Depuis la [page des publications](https://github.com/octopus-ai-ca/bitwarden-phosh/releases) :
 
 ```sh
-wget https://github.com/octopus-ai-ca/bitwarden-phosh/releases/download/v0.4.0/coffre-0.4.0-r0-aarch64.apk
-wget https://github.com/octopus-ai-ca/bitwarden-phosh/releases/download/v0.4.0/coffre-aarch64.apk.sha256
+wget https://github.com/octopus-ai-ca/bitwarden-phosh/releases/download/v0.5.0/coffre-0.5.0-r0-aarch64.apk
+wget https://github.com/octopus-ai-ca/bitwarden-phosh/releases/download/v0.5.0/coffre-aarch64.apk.sha256
 sha256sum -c coffre-aarch64.apk.sha256
-doas apk add --allow-untrusted ./coffre-0.4.0-r0-aarch64.apk
+doas apk add --allow-untrusted ./coffre-0.5.0-r0-aarch64.apk
 ```
 
 `--allow-untrusted` est nécessaire, car le paquet est signé par une clé propre à chaque
@@ -111,7 +121,7 @@ Sur le téléphone (ou dans `pmbootstrap chroot`), avec l'APKBUILD de la publica
 doas apk add alpine-sdk
 abuild-keygen -a -i
 mkdir coffre && cd coffre
-wget https://github.com/octopus-ai-ca/bitwarden-phosh/releases/download/v0.4.0/APKBUILD
+wget https://github.com/octopus-ai-ca/bitwarden-phosh/releases/download/v0.5.0/APKBUILD
 abuild -r
 ```
 
@@ -126,7 +136,7 @@ leur rustc est trop ancien pour gtk-rs 0.11.
 
 ### Autres distributions (glibc)
 
-Les archives `coffre-v0.4.0-linux-glibc-*.tar.gz` visent Debian, Ubuntu ou Fedora (GTK
+Les archives `coffre-v0.5.0-linux-glibc-*.tar.gz` visent Debian, Ubuntu ou Fedora (GTK
 4.14+ et libadwaita 1.5+) : extraire puis lancer `install.sh`.
 
 ## Compilation
@@ -147,6 +157,7 @@ cargo test -- --ignored   # test réseau réel contre bitwarden.com
 # parcours complet contre un Vaultwarden local :
 # (DOMAIN=http://localhost:8000 côté Vaultwarden pour le test WebAuthn)
 COFFRE_E2E_SERVER=http://localhost:8000 cargo test e2e -- --ignored --test-threads=1
+# (COFFRE_E2E_KEEP=1 garde le compte du test e2e_operations, rempli de données de démonstration)
 # relais NCI (C) et parcours Coffre → relais → contrôleur NFC simulé :
 make -C contrib/nci-bridge check
 COFFRE_NCI_BRIDGE=contrib/nci-bridge/test_nci_bridge cargo test pont_c -- --ignored
@@ -158,17 +169,22 @@ COFFRE_NCI_BRIDGE=contrib/nci-bridge/test_nci_bridge cargo test pont_c -- --igno
 src/
 ├── main.rs        Point d'entrée, pont Tokio ↔ boucle GLib
 ├── backend.rs     Session SDK : connexion, 2FA, synchro, (dé)verrouillage, déchiffrement
+├── backend/ops.rs Dossiers, archive, corbeille, import, export, Send, appareils, générateurs
 ├── config.rs      Préférences non sensibles
 ├── security_key.rs Clés FIDO2 (CTAP2) par USB ou NFC, repli NCI sans pcscd
 ├── nfc_nci.rs     NCI ISO-DEP et CTAP-sur-NFC par le démon de la puce intégrée
 └── ui/
-    ├── mod.rs     Fenêtre, navigation, verrouillage auto, presse-papier
+    ├── mod.rs     Fenêtre, accueil à onglets, expiration, presse-papier
+    ├── style.rs   Palette, feuilles de style, logo
     ├── login.rs   Connexion, déverrouillage (mot de passe ou NIP)
     ├── two_factor.rs  Connexion en deux étapes (code, YubiKey, clé FIDO2)
-    ├── vault.rs   Liste et recherche
+    ├── vault.rs   Coffre : recherche, filtres, favoris, archive, corbeille
+    ├── generator.rs Générateur
+    ├── send.rs    Send
+    ├── settings.rs Paramètres et sous-pages
     ├── detail.rs  Détail d'un élément
     └── edit.rs    Création et modification
-data/              .desktop, metainfo, icône
+data/              .desktop, metainfo, logo et icônes
 packaging/         APKBUILD postmarketOS et script de compilation Alpine
 contrib/nci-bridge/ Relais NCI (C) à intégrer au démon NFC du téléphone
 .github/workflows/ CI et publication (.apk postmarketOS + binaires glibc, x86_64 et aarch64)

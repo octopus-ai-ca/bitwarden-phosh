@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/ca/octopusai/Coffre">
+    <file>icons/scalable/actions/coffre-send-symbolic.svg</file>
+    <file>icons/scalable/actions/coffre-generator-symbolic.svg</file>
+    <file>icons/scalable/actions/coffre-external-link-symbolic.svg</file>
+  </gresource>
+</gresources>

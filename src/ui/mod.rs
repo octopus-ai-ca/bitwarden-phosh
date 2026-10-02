@@ -1,32 +1,37 @@
 //! Interface GTK4/libadwaita. Une seule fenêtre contenant un `AdwNavigationView` :
-//! connexion → (2FA) → coffre → détail → modification, et une page de verrouillage.
+//! connexion → (2FA) → accueil à onglets (Coffre, Générateur, Send, Paramètres),
+//! puis les sous-pages empilées par-dessus, et une page de verrouillage.
 
 mod detail;
 mod edit;
+mod generator;
 mod login;
+mod send;
+mod settings;
+mod style;
 mod two_factor;
 mod vault;
 
 use std::cell::RefCell;
+use std::future::Future;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use adw::prelude::*;
+use chrono::{DateTime, Datelike, Local, Timelike, Utc};
 use gtk::{gio, glib};
 
-use crate::backend::{ItemDraft, ItemKind, Session};
-use crate::config::Config;
-
-/// Délai d'inactivité avant le verrouillage automatique.
-const AUTO_LOCK_AFTER: Duration = Duration::from_secs(5 * 60);
-/// Délai avant l'effacement du presse-papier.
-const CLIPBOARD_CLEAR_SECS: u32 = 30;
+use crate::backend::{Error, FolderInfo, ItemDraft, ItemKind, Session};
+use crate::config::{Config, TimeoutAction};
 
 struct State {
     config: Config,
     session: Option<Session>,
     last_activity: Instant,
 }
+
+/// Fonction de rechargement d'un onglet de l'accueil.
+type Reload = Rc<dyn Fn()>;
 
 /// Poignée partagée (bon marché à cloner) vers la fenêtre et l'état de l'application.
 #[derive(Clone)]
@@ -37,6 +42,8 @@ pub struct Inner {
     nav: adw::NavigationView,
     toasts: adw::ToastOverlay,
     state: RefCell<State>,
+    /// Onglets de l'accueil à recharger après une modification du coffre.
+    reloads: RefCell<Vec<Reload>>,
 }
 
 impl std::ops::Deref for App {
@@ -48,6 +55,7 @@ impl std::ops::Deref for App {
 
 impl App {
     pub fn new(app: &adw::Application) -> Self {
+        style::install();
         let nav = adw::NavigationView::new();
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&nav));
@@ -62,16 +70,20 @@ impl App {
             .content(&toasts)
             .build();
 
+        let config = Config::load();
+        style::apply(&config);
         let this = Self(Rc::new(Inner {
             window,
             nav,
             toasts,
             state: RefCell::new(State {
-                config: Config::load(),
+                config,
                 session: None,
                 last_activity: Instant::now(),
             }),
+            reloads: RefCell::default(),
         }));
+        this.apply_density();
         this.setup_actions();
         this.setup_auto_lock();
         this.restore_session();
@@ -80,10 +92,8 @@ impl App {
 
     /// Au démarrage : restaure la session précédente (verrouillée) ou affiche la connexion.
     fn restore_session(&self) {
-        let loading = adw::StatusPage::builder()
-            .icon_name("dialog-password-symbolic")
-            .title("Coffre")
-            .build();
+        let loading = adw::StatusPage::builder().title("Coffre").build();
+        loading.set_paintable(style::logo_texture().as_ref());
         self.nav.replace(&[adw::NavigationPage::builder()
             .title("Coffre")
             .child(&loading)
@@ -131,7 +141,7 @@ impl App {
     fn setup_actions(&self) {
         let logout = gio::SimpleAction::new("logout", None);
         let app = self.clone();
-        logout.connect_activate(move |_, _| app.logout());
+        logout.connect_activate(move |_, _| app.confirm_logout());
         self.window.add_action(&logout);
 
         let lock = gio::SimpleAction::new("lock", None);
@@ -141,46 +151,26 @@ impl App {
 
         let about = gio::SimpleAction::new("about", None);
         let app = self.clone();
-        about.connect_activate(move |_, _| {
-            adw::AboutDialog::builder()
-                .application_name("Coffre")
-                .application_icon(crate::APP_ID)
-                .version(env!("CARGO_PKG_VERSION"))
-                .comments(
-                    "Client Bitwarden adaptatif pour Phosh, bâti sur le SDK officiel Bitwarden.",
-                )
-                .license_type(gtk::License::Gpl30Only)
-                .developer_name("Octopus AI")
-                .build()
-                .present(Some(&app.window));
-        });
+        about.connect_activate(move |_, _| app.show_about());
         self.window.add_action(&about);
-
-        let new_item = gio::SimpleAction::new("new-item", None);
-        let app = self.clone();
-        new_item.connect_activate(move |_, _| {
-            app.show_editor(None, ItemKind::Login, ItemDraft::default())
-        });
-        self.window.add_action(&new_item);
-
-        let set_pin = gio::SimpleAction::new("set-pin", None);
-        let app = self.clone();
-        set_pin.connect_activate(move |_, _| login::set_pin_dialog(&app));
-        self.window.add_action(&set_pin);
-
-        let clear_pin = gio::SimpleAction::new("clear-pin", None);
-        let app = self.clone();
-        clear_pin.connect_activate(move |_, _| {
-            if let Some(session) = app.session() {
-                session.clear_pin();
-                app.toast("NIP retiré");
-                app.show_vault();
-            }
-        });
-        self.window.add_action(&clear_pin);
     }
 
-    /// Verrouille après `AUTO_LOCK_AFTER` sans interaction (tactile ou clavier).
+    fn show_about(&self) {
+        adw::AboutDialog::builder()
+            .application_name("Coffre")
+            .application_icon(crate::APP_ID)
+            .version(env!("CARGO_PKG_VERSION"))
+            .comments("Client Bitwarden adaptatif pour Phosh, bâti sur le SDK officiel Bitwarden.")
+            .license_type(gtk::License::Gpl30Only)
+            .developer_name("Octopus AI")
+            .website("https://github.com/octopus-ai-ca/bitwarden-phosh")
+            .issue_url("https://github.com/octopus-ai-ca/bitwarden-phosh/issues")
+            .build()
+            .present(Some(&self.window));
+    }
+
+    /// Expire la session (verrouillage ou déconnexion) après le délai choisi sans
+    /// interaction (tactile ou clavier).
     fn setup_auto_lock(&self) {
         let touch = gtk::GestureClick::new();
         touch.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -203,14 +193,25 @@ impl App {
                 return glib::ControlFlow::Break;
             };
             let app = App(inner);
-            let expired = {
+            let action = {
                 let state = app.state.borrow();
-                state.last_activity.elapsed() >= AUTO_LOCK_AFTER
-                    && state.session.as_ref().is_some_and(Session::is_unlocked)
+                let minutes = state.config.lock_minutes;
+                let expired = minutes > 0
+                    && state.last_activity.elapsed()
+                        >= Duration::from_secs(u64::from(minutes) * 60)
+                    && state.session.as_ref().is_some_and(Session::is_unlocked);
+                expired.then_some(state.config.timeout_action)
             };
-            if expired {
-                app.lock();
-                app.toast("Coffre verrouillé après inactivité");
+            match action {
+                Some(TimeoutAction::Lock) => {
+                    app.lock();
+                    app.toast("Coffre verrouillé après inactivité");
+                }
+                Some(TimeoutAction::Logout) => {
+                    app.logout();
+                    app.toast("Session expirée : vous avez été déconnecté");
+                }
+                None => {}
             }
             glib::ControlFlow::Continue
         });
@@ -228,10 +229,31 @@ impl App {
         self.state.borrow_mut().session = session;
     }
 
+    pub fn config(&self) -> Config {
+        self.state.borrow().config.clone()
+    }
+
+    /// Modifie puis enregistre la configuration.
+    pub fn update_config(&self, change: impl FnOnce(&mut Config)) {
+        let mut state = self.state.borrow_mut();
+        change(&mut state.config);
+        state.config.save();
+    }
+
+    /// Mode compact : classe CSS sur la fenêtre.
+    fn apply_density(&self) {
+        if self.config().compact {
+            self.window.add_css_class("compact");
+        } else {
+            self.window.remove_css_class("compact");
+        }
+    }
+
     // ----- Navigation -----
 
     pub fn show_login(&self) {
-        let config = self.state.borrow().config.clone();
+        let config = self.config();
+        self.reloads.borrow_mut().clear();
         self.nav.replace(&[login::login_page(self, &config)]);
     }
 
@@ -246,17 +268,96 @@ impl App {
         ));
     }
 
+    /// Accueil sur l'onglet du coffre.
     fn show_vault(&self) {
-        self.nav.replace(&[vault::vault_page(self)]);
+        self.show_home("vault");
+    }
+
+    /// Accueil à onglets avec la barre de navigation du bas.
+    fn show_home(&self, tab: &str) {
+        self.reloads.borrow_mut().clear();
+        let stack = adw::ViewStack::new();
+        stack.add_titled_with_icon(
+            &vault::vault_tab(self),
+            Some("vault"),
+            "Coffre",
+            "dialog-password-symbolic",
+        );
+        stack.add_titled_with_icon(
+            &generator::generator_tab(self),
+            Some("generator"),
+            "Générateur",
+            "coffre-generator-symbolic",
+        );
+        stack.add_titled_with_icon(
+            &send::send_tab(self),
+            Some("send"),
+            "Send",
+            "coffre-send-symbolic",
+        );
+        stack.add_titled_with_icon(
+            &settings::settings_tab(self),
+            Some("settings"),
+            "Paramètres",
+            "emblem-system-symbolic",
+        );
+        stack.set_visible_child_name(tab);
+
+        let bar = adw::ViewSwitcherBar::builder()
+            .stack(&stack)
+            .reveal(true)
+            .build();
+        let toolbar = adw::ToolbarView::new();
+        toolbar.set_content(Some(&stack));
+        toolbar.add_bottom_bar(&bar);
+        self.nav.replace(&[adw::NavigationPage::builder()
+            .title("Coffre")
+            .tag("home")
+            .child(&toolbar)
+            .build()]);
+    }
+
+    /// Recharge les onglets de l'accueil (après une modification du coffre).
+    pub fn refresh(&self) {
+        let reloads = self.reloads.borrow().clone();
+        for reload in reloads {
+            reload();
+        }
+    }
+
+    fn register_reload(&self, reload: impl Fn() + 'static) {
+        self.reloads.borrow_mut().push(Rc::new(reload));
+    }
+
+    /// Retour à l'accueil (dépile les sous-pages), puis recharge.
+    pub fn back_home(&self) {
+        self.nav.pop_to_tag("home");
+        self.refresh();
     }
 
     fn show_lock(&self) {
+        self.reloads.borrow_mut().clear();
         self.nav.replace(&[login::lock_page(self)]);
+    }
+
+    pub fn push(&self, page: &adw::NavigationPage) {
+        self.nav.push(page);
     }
 
     /// Page de modification (`id` fourni) ou de création (`id` absent).
     pub fn show_editor(&self, id: Option<String>, kind: ItemKind, draft: ItemDraft) {
-        self.nav.push(&edit::edit_page(self, id, kind, draft));
+        let Some(session) = self.session() else {
+            return;
+        };
+        let app = self.clone();
+        crate::spawn(
+            async move { session.folders().await },
+            move |folders: Result<Vec<FolderInfo>, Error>| {
+                let folders = folders.unwrap_or_default();
+                app.nav
+                    .push(&edit::edit_page(&app, id, kind, draft, folders));
+            },
+        );
     }
 
     pub fn show_detail(&self, id: String) {
@@ -287,7 +388,7 @@ impl App {
             async move {
                 session.sync().await?;
                 session.unlock(password).await?;
-                Ok::<_, crate::backend::Error>(session)
+                Ok::<_, Error>(session)
             },
             move |result| match result {
                 Ok(session) => {
@@ -305,10 +406,10 @@ impl App {
     }
 
     fn remember_account(&self, server: crate::backend::Server, email: String) {
-        let mut state = self.state.borrow_mut();
-        state.config.server = server;
-        state.config.email = email;
-        state.config.save();
+        self.update_config(|config| {
+            config.server = server;
+            config.email = email;
+        });
     }
 
     fn device_id(&self) -> String {
@@ -351,26 +452,19 @@ impl App {
         );
     }
 
-    pub fn sync(&self, done: impl FnOnce() + 'static) {
-        let Some(mut session) = self.session() else {
-            return;
-        };
-        let app = self.clone();
-        crate::spawn(
-            async move {
+    /// Synchronise, recharge les onglets, puis appelle `done(succès)`.
+    pub fn sync(&self, done: impl FnOnce(bool) + 'static) {
+        self.mutate(
+            |mut session| async move {
                 session.sync().await?;
-                Ok::<_, crate::backend::Error>(session)
+                Ok((session, ()))
             },
-            move |result| {
-                match result {
-                    Ok(session) => {
-                        app.set_session(Some(session));
-                        app.show_vault();
-                        app.toast("Coffre synchronisé");
-                    }
+            move |app, result| {
+                match &result {
+                    Ok(()) => app.toast("Coffre synchronisé"),
                     Err(e) => app.toast(&e.to_string()),
                 }
-                done();
+                done(result.is_ok());
             },
         );
     }
@@ -378,36 +472,66 @@ impl App {
     /// Synchronisation en arrière-plan après un déverrouillage; le coffre local
     /// reste utilisable hors ligne en cas d'échec.
     fn sync_quietly(&self) {
-        let Some(mut session) = self.session() else {
-            return;
-        };
-        let app = self.clone();
-        crate::spawn(
-            async move {
+        self.mutate(
+            |mut session| async move {
                 session.sync().await?;
-                Ok::<_, crate::backend::Error>(session)
+                Ok((session, ()))
             },
-            move |result| match result {
-                Ok(session) => {
-                    let on_vault = app
-                        .nav
-                        .visible_page()
-                        .and_then(|p| p.tag())
-                        .is_some_and(|t| t == "vault");
-                    app.set_session(Some(session));
-                    if on_vault {
-                        app.show_vault();
-                    }
-                }
-                Err(crate::backend::Error::SessionExpired) => {
-                    app.toast("Session expirée : déconnectez-vous puis reconnectez-vous pour synchroniser.");
-                }
+            |app, result| match result {
+                Ok(()) => {}
+                Err(Error::SessionExpired) => app.toast(
+                    "Session expirée : déconnectez-vous puis reconnectez-vous pour synchroniser.",
+                ),
                 Err(e) => eprintln!("synchronisation en arrière-plan : {e}"),
             },
         );
     }
 
-    /// Enregistre un élément (création si `id` est absent), puis revient au coffre.
+    /// Exécute une opération qui modifie la session (synchronisation, dossiers…),
+    /// conserve la session mise à jour, recharge les onglets, puis appelle `done`.
+    pub fn mutate<T, F, Fut>(&self, op: F, done: impl FnOnce(&App, Result<T, Error>) + 'static)
+    where
+        T: Send + 'static,
+        F: FnOnce(Session) -> Fut,
+        Fut: Future<Output = Result<(Session, T), Error>> + Send + 'static,
+    {
+        let Some(session) = self.session() else {
+            return;
+        };
+        let app = self.clone();
+        crate::spawn(op(session), move |result| {
+            let result = result.map(|(session, value)| {
+                // Ne pas ressusciter une session fermée entre-temps.
+                if app.session().is_some() {
+                    app.set_session(Some(session));
+                }
+                value
+            });
+            if result.is_ok() {
+                app.refresh();
+            }
+            done(&app, result);
+        });
+    }
+
+    /// Exécute une opération en lecture seule sur la session.
+    pub fn with_session<T, F, Fut>(
+        &self,
+        op: F,
+        done: impl FnOnce(&App, Result<T, Error>) + 'static,
+    ) where
+        T: Send + 'static,
+        F: FnOnce(Session) -> Fut,
+        Fut: Future<Output = Result<T, Error>> + Send + 'static,
+    {
+        let Some(session) = self.session() else {
+            return;
+        };
+        let app = self.clone();
+        crate::spawn(op(session), move |result| done(&app, result));
+    }
+
+    /// Enregistre un élément (création si `id` est absent), puis revient à l'accueil.
     fn save_item(
         &self,
         id: Option<String>,
@@ -415,22 +539,17 @@ impl App {
         draft: ItemDraft,
         done: impl FnOnce(bool) + 'static,
     ) {
-        let Some(mut session) = self.session() else {
-            return;
-        };
-        let app = self.clone();
-        crate::spawn(
-            async move {
+        self.mutate(
+            |mut session| async move {
                 match id {
                     Some(id) => session.edit_item(&id, draft).await?,
                     None => session.create_item(kind, draft).await?,
                 }
-                Ok::<_, crate::backend::Error>(session)
+                Ok((session, ()))
             },
-            move |result| match result {
-                Ok(session) => {
-                    app.set_session(Some(session));
-                    app.show_vault();
+            move |app, result| match result {
+                Ok(()) => {
+                    app.back_home();
                     app.toast("Élément enregistré");
                     done(true);
                 }
@@ -442,22 +561,53 @@ impl App {
         );
     }
 
-    /// Envoie un élément à la corbeille, puis revient au coffre.
+    /// Envoie un élément à la corbeille.
     fn trash_item(&self, id: String) {
-        let Some(session) = self.session() else {
-            return;
-        };
-        let app = self.clone();
-        crate::spawn(
-            async move { session.trash(&id).await },
-            move |result| match result {
+        self.mutate(
+            |mut session| async move {
+                session.trash(&id).await?;
+                session.sync().await?;
+                Ok((session, ()))
+            },
+            |app, result| match result {
                 Ok(()) => {
-                    app.show_vault();
+                    app.back_home();
                     app.toast("Élément envoyé à la corbeille");
                 }
                 Err(e) => app.toast(&e.to_string()),
             },
         );
+    }
+
+    /// Demande une confirmation avant d'envoyer un élément à la corbeille.
+    pub fn confirm_trash(&self, id: String) {
+        let dialog = adw::AlertDialog::builder()
+            .heading("Envoyer à la corbeille ?")
+            .body("L'élément pourra être restauré depuis la corbeille pendant 30 jours.")
+            .default_response("cancel")
+            .close_response("cancel")
+            .build();
+        dialog.add_response("cancel", "Annuler");
+        dialog.add_response("trash", "Corbeille");
+        dialog.set_response_appearance("trash", adw::ResponseAppearance::Destructive);
+        let app = self.clone();
+        dialog.connect_response(Some("trash"), move |_, _| app.trash_item(id.clone()));
+        dialog.present(Some(&self.window));
+    }
+
+    fn confirm_logout(&self) {
+        let dialog = adw::AlertDialog::builder()
+            .heading("Se déconnecter ?")
+            .body("Les données locales du coffre seront effacées de cet appareil.")
+            .default_response("cancel")
+            .close_response("cancel")
+            .build();
+        dialog.add_response("cancel", "Annuler");
+        dialog.add_response("logout", "Se déconnecter");
+        dialog.set_response_appearance("logout", adw::ResponseAppearance::Destructive);
+        let app = self.clone();
+        dialog.connect_response(Some("logout"), move |_, _| app.logout());
+        dialog.present(Some(&self.window));
     }
 
     /// Déconnexion : efface les clés, le NIP et toutes les données locales.
@@ -470,19 +620,41 @@ impl App {
         self.show_login();
     }
 
-    /// Copie `value` puis efface le presse-papier après `CLIPBOARD_CLEAR_SECS`
-    /// s'il contient toujours notre valeur.
+    /// Copie `value` puis efface le presse-papier après le délai choisi s'il
+    /// contient toujours notre valeur.
     pub fn copy(&self, label: &str, value: &str) {
         let clipboard = self.window.clipboard();
         clipboard.set_text(value);
-        self.toast(&format!(
-            "{label} copié — effacé dans {CLIPBOARD_CLEAR_SECS} s"
-        ));
-        glib::timeout_add_seconds_local_once(CLIPBOARD_CLEAR_SECS, move || {
+        let seconds = self.config().clipboard_seconds;
+        if seconds == 0 {
+            self.toast(&format!("{label} copié"));
+            return;
+        }
+        self.toast(&format!("{label} copié — effacé dans {seconds} s"));
+        glib::timeout_add_seconds_local_once(seconds, move || {
             if clipboard.is_local() {
                 clipboard.set_text("");
             }
         });
+    }
+
+    /// Ouvre une adresse dans le navigateur.
+    pub fn open_uri(&self, uri: &str) {
+        let uri = if uri.contains("://") {
+            uri.to_owned()
+        } else {
+            format!("https://{uri}")
+        };
+        let app = self.clone();
+        gtk::UriLauncher::new(&uri).launch(
+            Some(&self.window),
+            gio::Cancellable::NONE,
+            move |result| {
+                if let Err(e) = result {
+                    app.toast(&format!("Impossible d'ouvrir le lien : {e}"));
+                }
+            },
+        );
     }
 }
 
@@ -495,6 +667,18 @@ fn page(
     header: &adw::HeaderBar,
     content: &impl IsA<gtk::Widget>,
 ) -> adw::NavigationPage {
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(header);
+    toolbar.set_content(Some(&scrolled(content)));
+    adw::NavigationPage::builder()
+        .title(title)
+        .tag(tag)
+        .child(&toolbar)
+        .build()
+}
+
+/// Contenu défilant, centré et limité en largeur.
+fn scrolled(content: &impl IsA<gtk::Widget>) -> gtk::ScrolledWindow {
     let clamp = adw::Clamp::builder()
         .maximum_size(600)
         .margin_top(12)
@@ -503,19 +687,20 @@ fn page(
         .margin_end(12)
         .child(content)
         .build();
-    let scrolled = gtk::ScrolledWindow::builder()
+    gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vexpand(true)
         .child(&clamp)
-        .build();
+        .build()
+}
+
+/// Onglet de l'accueil : barre d'en-tête (titre `title`) et contenu.
+fn tab(title: &str, header: &adw::HeaderBar, content: &impl IsA<gtk::Widget>) -> adw::ToolbarView {
+    header.set_title_widget(Some(&adw::WindowTitle::new(title, "")));
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(header);
-    toolbar.set_content(Some(&scrolled));
-    adw::NavigationPage::builder()
-        .title(title)
-        .tag(tag)
-        .child(&toolbar)
-        .build()
+    toolbar.set_content(Some(content));
+    toolbar
 }
 
 fn pill_button(label: &str) -> gtk::Button {
@@ -525,6 +710,18 @@ fn pill_button(label: &str) -> gtk::Button {
         .margin_top(12)
         .build();
     button.add_css_class("pill");
+    button.add_css_class("suggested-action");
+    button
+}
+
+/// Bouton « + Créer » des en-têtes.
+fn create_button(label: &str) -> gtk::Button {
+    let content = adw::ButtonContent::builder()
+        .icon_name("list-add-symbolic")
+        .label(label)
+        .build();
+    let button = gtk::Button::builder().child(&content).build();
+    button.add_css_class("create");
     button.add_css_class("suggested-action");
     button
 }
@@ -543,4 +740,107 @@ fn icon_button(icon: &str, tooltip: &str) -> gtk::Button {
         .build();
     button.add_css_class("flat");
     button
+}
+
+/// Liste en cartes séparées (style de l'extension).
+fn card_list() -> gtk::ListBox {
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .valign(gtk::Align::Start)
+        .build();
+    list.add_css_class("cards");
+    list
+}
+
+/// Rangée de navigation (icône, titre, chevron).
+fn nav_row(icon: &str, title: &str) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(title)
+        .activatable(true)
+        .build();
+    row.add_prefix(&gtk::Image::from_icon_name(icon));
+    row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+    row
+}
+
+/// Rangée qui ouvre un lien externe.
+fn link_row(icon: &str, title: &str) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(title)
+        .activatable(true)
+        .build();
+    row.add_prefix(&gtk::Image::from_icon_name(icon));
+    row.add_suffix(&gtk::Image::from_icon_name("coffre-external-link-symbolic"));
+    row
+}
+
+/// État vide : titre, description et action facultative.
+fn empty_state(icon: &str, title: &str, description: &str) -> adw::StatusPage {
+    let status = adw::StatusPage::builder()
+        .icon_name(icon)
+        .title(title)
+        .description(glib::markup_escape_text(description).as_str())
+        .vexpand(true)
+        .build();
+    status.add_css_class("compact");
+    status
+}
+
+/// En-tête de section « Titre  N ».
+fn section_header(title: &str) -> (gtk::Box, gtk::Label) {
+    let label = gtk::Label::builder().label(title).xalign(0.0).build();
+    label.add_css_class("section-title");
+    let count = gtk::Label::new(None);
+    count.add_css_class("section-count");
+    let header = gtk::Box::builder()
+        .spacing(8)
+        .margin_start(4)
+        .margin_bottom(6)
+        .build();
+    header.append(&label);
+    header.append(&count);
+    (header, count)
+}
+
+const MONTHS: [&str; 12] = [
+    "janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.",
+    "déc.",
+];
+
+/// Date et heure locales en français : « 2 oct. 2026, 14 h 05 ».
+fn fr_datetime(date: DateTime<Utc>) -> String {
+    let local = date.with_timezone(&Local);
+    format!(
+        "{} {} {}, {} h {:02}",
+        local.day(),
+        MONTHS[local.month0() as usize],
+        local.year(),
+        local.hour(),
+        local.minute()
+    )
+}
+
+/// Date locale en français : « 2 oct. 2026 ».
+fn fr_date(date: DateTime<Utc>) -> String {
+    let local = date.with_timezone(&Local);
+    format!(
+        "{} {} {}",
+        local.day(),
+        MONTHS[local.month0() as usize],
+        local.year()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dates_en_francais() {
+        let date = DateTime::parse_from_rfc3339("2026-08-15T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(fr_date(date).ends_with("août 2026"));
+        assert!(fr_datetime(date).contains("août 2026, "));
+    }
 }

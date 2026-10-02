@@ -316,6 +316,10 @@ impl Page {
                     KeyEvent::Touch => state.set_key_state(true, "Touchez votre clé de sécurité."),
                     KeyEvent::Processing => state.set_key_state(true, "Vérification…"),
                     KeyEvent::Pin(reply) => pin_dialog(&state.app, reply),
+                    KeyEvent::Retrying(n) => state.set_key_state(
+                        true,
+                        &format!("Clé perdue : reposez-la sur le lecteur (essai {n})…"),
+                    ),
                 }
             }
         });

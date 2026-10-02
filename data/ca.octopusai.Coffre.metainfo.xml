@@ -35,6 +35,11 @@
     <control>pointing</control>
   </supports>
   <releases>
+    <release version="0.5.0" date="2026-10-02">
+      <description>
+        <p>Nouvelle interface à onglets (Coffre, Générateur, Send, Paramètres), logo, dossiers, favoris, archive, corbeille, import et export, Send texte, appareils et réessai automatique après le NIP de la clé de sécurité.</p>
+      </description>
+    </release>
     <release version="0.4.0" date="2026-09-30">
       <description>
         <p>Clé de sécurité par la puce NFC intégrée du téléphone (démon NCI), en repli de pcscd.</p>

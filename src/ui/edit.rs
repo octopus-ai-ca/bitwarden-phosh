@@ -6,7 +6,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 
 use super::{App, icon_button, page, set_busy};
-use crate::backend::{ItemDraft, ItemKind};
+use crate::backend::{FolderInfo, ItemDraft, ItemKind};
 
 const KINDS: [&str; 2] = ["Identifiant", "Note sécurisée"];
 
@@ -15,6 +15,7 @@ pub fn edit_page(
     id: Option<String>,
     kind: ItemKind,
     draft: ItemDraft,
+    folders: Vec<FolderInfo>,
 ) -> adw::NavigationPage {
     let kind = Rc::new(Cell::new(kind));
     let creating = id.is_none();
@@ -29,9 +30,28 @@ pub fn edit_page(
         .title("Nom")
         .text(draft.name.as_str())
         .build();
+    let mut folder_labels = vec!["Aucun dossier"];
+    folder_labels.extend(folders.iter().map(|f| f.name.as_str()));
+    let folder_row = adw::ComboRow::builder()
+        .title("Dossier")
+        .model(&gtk::StringList::new(&folder_labels))
+        .selected(
+            draft
+                .folder_id
+                .as_ref()
+                .and_then(|id| folders.iter().position(|f| &f.id == id))
+                .map_or(0, |i| i as u32 + 1),
+        )
+        .build();
+    let favorite_row = adw::SwitchRow::builder()
+        .title("Favori")
+        .active(draft.favorite)
+        .build();
     let general = adw::PreferencesGroup::new();
     general.add(&kind_row);
     general.add(&name_row);
+    general.add(&folder_row);
+    general.add(&favorite_row);
 
     let username_row = adw::EntryRow::builder()
         .title("Nom d'utilisateur")
@@ -116,7 +136,7 @@ pub fn edit_page(
         trash.add_css_class("pill");
         trash.add_css_class("destructive-action");
         let app = app.clone();
-        trash.connect_clicked(move |_| confirm_trash(&app, id.clone()));
+        trash.connect_clicked(move |_| app.confirm_trash(id.clone()));
         content.append(&trash);
     }
 
@@ -135,6 +155,11 @@ pub fn edit_page(
                 notes: buffer
                     .text(&buffer.start_iter(), &buffer.end_iter(), false)
                     .to_string(),
+                folder_id: (folder_row.selected() as usize)
+                    .checked_sub(1)
+                    .and_then(|i| folders.get(i))
+                    .map(|f| f.id.clone()),
+                favorite: favorite_row.is_active(),
             };
             if draft.name.trim().is_empty() {
                 app.toast("Le nom de l'élément est obligatoire.");
@@ -159,19 +184,4 @@ pub fn edit_page(
         "Modifier"
     };
     page(title, "edit", &header, &content)
-}
-
-fn confirm_trash(app: &App, id: String) {
-    let dialog = adw::AlertDialog::builder()
-        .heading("Envoyer à la corbeille ?")
-        .body("L'élément pourra être restauré depuis le coffre web pendant 30 jours.")
-        .default_response("cancel")
-        .close_response("cancel")
-        .build();
-    dialog.add_response("cancel", "Annuler");
-    dialog.add_response("trash", "Corbeille");
-    dialog.set_response_appearance("trash", adw::ResponseAppearance::Destructive);
-    let app_ = app.clone();
-    dialog.connect_response(Some("trash"), move |_, _| app_.trash_item(id.clone()));
-    dialog.present(Some(&app.window));
 }

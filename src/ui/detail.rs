@@ -11,6 +11,17 @@ use super::{App, icon_button, page};
 pub fn detail_page(app: &App, view: CipherView) -> adw::NavigationPage {
     let content = gtk::Box::new(gtk::Orientation::Vertical, 18);
 
+    if app.config().auto_copy_totp
+        && let Some(code) = view
+            .login
+            .as_ref()
+            .and_then(|l| l.totp.as_deref())
+            .and_then(crate::backend::totp)
+            .map(|(code, _)| code)
+    {
+        app.copy("Code TOTP", &code);
+    }
+
     if let Some(login) = &view.login {
         let group = adw::PreferencesGroup::builder()
             .title("Identifiants")
@@ -216,7 +227,7 @@ fn uri_row(app: &App, uri: &str) -> adw::ActionRow {
         .title_lines(1)
         .build();
     if uri.starts_with("https://") || uri.starts_with("http://") {
-        let open = icon_button("adw-external-link-symbolic", "Ouvrir");
+        let open = icon_button("coffre-external-link-symbolic", "Ouvrir");
         let (window, uri_) = (app.window.clone(), uri.to_owned());
         open.connect_clicked(move |_| {
             gtk::UriLauncher::new(&uri_).launch(Some(&window), gtk::gio::Cancellable::NONE, |_| {});

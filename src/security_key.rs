@@ -25,6 +25,10 @@ use crate::nfc_nci::{self, Nci, NciToken};
 
 /// Délai laissé pour brancher ou approcher la clé, puis la toucher.
 const TIMEOUT: Duration = Duration::from_secs(60);
+/// Après la saisie du NIP, si la clé a quitté le champ, nouvel essai chaque
+/// seconde pendant ce délai (avec le même NIP, sans le redemander).
+const PIN_RETRY_WINDOW: Duration = Duration::from_secs(5);
+const PIN_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Événements envoyés à l'interface pendant l'opération.
 #[derive(Debug)]
@@ -37,6 +41,8 @@ pub enum KeyEvent {
     Processing,
     /// La clé exige son NIP; répondre `None` pour annuler.
     Pin(mpsc::Sender<Option<String>>),
+    /// La clé a été perdue après la saisie du NIP : nouvel essai n° `.0`.
+    Retrying(u32),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -47,6 +53,10 @@ pub enum KeyError {
     Cancelled,
     #[error("Cette clé n'est pas enregistrée pour ce compte.")]
     UnknownCredential,
+    #[error("NIP de la clé incorrect.")]
+    WrongPin,
+    #[error("NIP de la clé bloqué : retirez puis rebranchez la clé, ou réinitialisez-la.")]
+    PinBlocked,
     #[error("Défi WebAuthn invalide : {0}")]
     BadChallenge(String),
     #[error("Clé de sécurité : {0}")]
@@ -58,6 +68,12 @@ impl From<WebauthnCError> for KeyError {
         use webauthn_authenticator_rs::error::CtapError;
         match e {
             WebauthnCError::Ctap(CtapError::Ctap2NoCredentials) => Self::UnknownCredential,
+            WebauthnCError::Ctap(CtapError::Ctap2PinInvalid | CtapError::Ctap2PinAuthInvalid) => {
+                Self::WrongPin
+            }
+            WebauthnCError::Ctap(CtapError::Ctap2PinBlocked | CtapError::Ctap2PinAuthBlocked) => {
+                Self::PinBlocked
+            }
             WebauthnCError::Ctap(
                 CtapError::Ctap2UserActionTimeout | CtapError::Ctap2ActionTimeout,
             ) => Self::Timeout,
@@ -92,18 +108,49 @@ pub fn assert_with<B: AuthenticatorBackend>(
     serde_json::to_string(&credential).map_err(|e| KeyError::Device(e.to_string()))
 }
 
+impl KeyError {
+    /// Erreur de transport (clé retirée du champ ou débranchée) : un nouvel
+    /// essai a un sens. Un NIP refusé n'est jamais réessayé, pour ne pas
+    /// consommer les essais de la clé.
+    fn is_transport(&self) -> bool {
+        matches!(self, Self::Device(_))
+    }
+}
+
 /// Pont entre les rappels de la bibliothèque CTAP et l'interface GTK.
 #[derive(Debug)]
 struct ChannelUi {
     events: async_channel::Sender<KeyEvent>,
     cancelled: Arc<AtomicBool>,
+    /// NIP saisi pendant cette opération, et moment de sa validation.
+    pin: std::sync::Mutex<Option<(String, std::time::Instant)>>,
+}
+
+impl ChannelUi {
+    fn pin_validated_at(&self) -> Option<std::time::Instant> {
+        self.pin.lock().ok()?.as_ref().map(|(_, at)| *at)
+    }
+
+    fn forget_pin(&self) {
+        if let Ok(mut pin) = self.pin.lock() {
+            *pin = None;
+        }
+    }
 }
 
 impl UiCallback for ChannelUi {
     fn request_pin(&self) -> Option<String> {
+        // Nouvel essai après la perte de la clé : même NIP, sans redemander.
+        if let Some((pin, _)) = self.pin.lock().ok()?.as_ref() {
+            return Some(pin.clone());
+        }
         let (tx, rx) = mpsc::channel();
         self.events.send_blocking(KeyEvent::Pin(tx)).ok()?;
-        rx.recv_timeout(Duration::from_secs(120)).ok().flatten()
+        let pin = rx.recv_timeout(Duration::from_secs(120)).ok().flatten()?;
+        if let Ok(mut cached) = self.pin.lock() {
+            *cached = Some((pin.clone(), std::time::Instant::now()));
+        }
+        Some(pin)
     }
 
     fn request_touch(&self) {
@@ -152,17 +199,67 @@ fn authenticate_with(
     let ui = ChannelUi {
         events: events.clone(),
         cancelled: cancelled.clone(),
+        pin: std::sync::Mutex::new(None),
     };
-    let mut request = Some((origin, options));
     runtime.block_on(async {
+        let mut deadline = tokio::time::Instant::now() + TIMEOUT;
+        let mut retries = 0;
+        loop {
+            let result = attempt(
+                &ui,
+                &events,
+                &nci_socket,
+                deadline,
+                origin.clone(),
+                options.clone(),
+            )
+            .await;
+            let error = match result {
+                Ok(token) => return Ok(token),
+                Err(error) => error,
+            };
+            if matches!(error, KeyError::WrongPin | KeyError::PinBlocked) {
+                ui.forget_pin();
+                return Err(error);
+            }
+            // Clé perdue peu après la validation du NIP : nouvel essai chaque
+            // seconde, jusqu'à 5 s après la validation.
+            let Some(validated_at) = ui.pin_validated_at() else {
+                return Err(error);
+            };
+            let window_end = validated_at + PIN_RETRY_WINDOW;
+            let next = std::time::Instant::now() + PIN_RETRY_INTERVAL;
+            if !error.is_transport() || next > window_end || cancelled.load(Ordering::Relaxed) {
+                return Err(error);
+            }
+            retries += 1;
+            eprintln!("clé perdue après le NIP ({error}) : nouvel essai {retries}");
+            let _ = events.try_send(KeyEvent::Retrying(retries));
+            tokio::time::sleep(PIN_RETRY_INTERVAL).await;
+            deadline = tokio::time::Instant::from_std(window_end);
+        }
+    })
+}
+
+/// Une tentative : attend une clé (USB, PC/SC ou puce intégrée) jusqu'à
+/// `deadline`, puis signe le défi.
+async fn attempt(
+    ui: &ChannelUi,
+    events: &async_channel::Sender<KeyEvent>,
+    nci_socket: &std::path::Path,
+    deadline: tokio::time::Instant,
+    origin: Url,
+    options: RequestChallengeResponse,
+) -> Result<String, KeyError> {
+    let mut request = Some((origin, options));
+    {
         let transport = AnyTransport::new().await?;
         // Repli : sans service PC/SC, la puce NFC intégrée passe par le démon NCI.
         let use_nci = transport.nfc.is_none() && nci_socket.exists();
         let mut tokens = transport.watch().await?;
-        let deadline = tokio::time::Instant::now() + TIMEOUT;
         let is_cancelled = || ui.cancelled.load(Ordering::Relaxed);
 
-        let nci_search = find_nci_key(&nci_socket, deadline, &is_cancelled, &ui);
+        let nci_search = find_nci_key(nci_socket, deadline, &is_cancelled, ui);
         tokio::pin!(nci_search);
         let mut nci_running = use_nci;
 
@@ -181,7 +278,7 @@ fn authenticate_with(
                 found = &mut nci_search, if nci_running => match found {
                     Ok(authenticator) => {
                         let (origin, options) = request.take().ok_or(KeyError::Cancelled)?;
-                        return finish(authenticator, &events, origin, options);
+                        return finish(authenticator, events, origin, options);
                     }
                     Err(nfc_nci::NciError::Cancelled) => return Err(KeyError::Cancelled),
                     Err(nfc_nci::NciError::Timeout) => return Err(KeyError::Timeout),
@@ -203,15 +300,15 @@ fn authenticate_with(
                     }
                     Ok(Some(TokenEvent::Removed(_))) => {}
                     Ok(Some(TokenEvent::Added(token))) => {
-                        if let Some(authenticator) = CtapAuthenticator::new(token, &ui).await {
+                        if let Some(authenticator) = CtapAuthenticator::new(token, ui).await {
                             let (origin, options) = request.take().ok_or(KeyError::Cancelled)?;
-                            return finish(authenticator, &events, origin, options);
+                            return finish(authenticator, events, origin, options);
                         }
                     }
                 },
             }
         }
-    })
+    }
 }
 
 /// Signe le défi avec la clé trouvée (hors de l'exécuteur asynchrone).
@@ -290,6 +387,15 @@ mod tests {
     /// Lance le contrôleur NCI simulé sur `socket` (un seul client) et retourne
     /// les APDU reçus par la clé.
     fn spawn_controller(socket: std::path::PathBuf) -> std::thread::JoinHandle<Vec<Vec<u8>>> {
+        spawn_controllers(socket, vec![false])
+    }
+
+    /// Un contrôleur simulé par connexion successive (`true` : clé à NIP qui
+    /// quitte le champ juste après la saisie du NIP).
+    fn spawn_controllers(
+        socket: std::path::PathBuf,
+        sessions: Vec<bool>,
+    ) -> std::thread::JoinHandle<Vec<Vec<u8>>> {
         let _ = std::fs::remove_file(&socket);
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -300,11 +406,14 @@ mod tests {
                 .unwrap();
             runtime.block_on(async move {
                 let listener = tokio::net::UnixListener::from_std(listener).unwrap();
-                let (stream, _) = listener.accept().await.unwrap();
                 let stats = Arc::new(std::sync::Mutex::new(
                     crate::nfc_nci::tests::Stats::default(),
                 ));
-                crate::nfc_nci::tests::run_controller(stream, stats.clone()).await;
+                for pin_then_lost in sessions {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    crate::nfc_nci::tests::run_controller(stream, stats.clone(), pin_then_lost)
+                        .await;
+                }
                 stats.lock().unwrap().apdus.clone()
             })
         })
@@ -386,6 +495,45 @@ mod tests {
         );
         let apdus = controller.join().unwrap();
         assert!(relay.wait().unwrap().success());
+        assert_reached_nfc_key(result, &apdus);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// La clé quitte le champ juste après la saisie de son NIP : Coffre
+    /// réessaie (sans redemander le NIP) et atteint la clé reposée.
+    #[test]
+    fn reessai_apres_nip_si_la_cle_quitte_le_champ() {
+        let dir = temp_dir("nip");
+        let socket = dir.join("nci.sock");
+        let controller = spawn_controllers(socket.clone(), vec![true, false]);
+        let (events, rx) = async_channel::unbounded();
+        let answers = std::thread::spawn(move || {
+            let (mut prompts, mut retries) = (0, Vec::new());
+            while let Ok(event) = rx.recv_blocking() {
+                match event {
+                    KeyEvent::Pin(reply) => {
+                        prompts += 1;
+                        reply.send(Some("1234".into())).unwrap();
+                    }
+                    KeyEvent::Retrying(n) => retries.push(n),
+                    _ => {}
+                }
+            }
+            (prompts, retries)
+        });
+        let started = std::time::Instant::now();
+        let result = authenticate_with(
+            Url::parse("http://localhost:8000").unwrap(),
+            test_options(),
+            events,
+            Arc::new(AtomicBool::new(false)),
+            socket,
+        );
+        let apdus = controller.join().unwrap();
+        let (prompts, retries) = answers.join().unwrap();
+        assert_eq!(prompts, 1, "le NIP ne doit être demandé qu'une fois");
+        assert_eq!(retries, vec![1]);
+        assert!(started.elapsed() >= PIN_RETRY_INTERVAL);
         assert_reached_nfc_key(result, &apdus);
         let _ = std::fs::remove_dir_all(&dir);
     }

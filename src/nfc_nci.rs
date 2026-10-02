@@ -681,6 +681,46 @@ pub(crate) mod tests {
         chained: Vec<u8>,
         pending_out: Vec<u8>,
         keepalives: usize,
+        /// Clé protégée par NIP, qui quitte le champ juste après sa saisie.
+        pin_then_lost: bool,
+        /// La clé a quitté le champ.
+        lost: bool,
+    }
+
+    /// Point générateur de P-256 : clé publique d'accord de clé valide.
+    const P256_GX: [u8; 32] = [
+        0x6B, 0x17, 0xD1, 0xF2, 0xE1, 0x2C, 0x42, 0x47, 0xF8, 0xBC, 0xE6, 0xE5, 0x63, 0xA4, 0x40,
+        0xF2, 0x77, 0x03, 0x7D, 0x81, 0x2D, 0xEB, 0x33, 0xA0, 0xF4, 0xA1, 0x39, 0x45, 0xD8, 0x98,
+        0xC2, 0x96,
+    ];
+    const P256_GY: [u8; 32] = [
+        0x4F, 0xE3, 0x42, 0xE2, 0xFE, 0x1A, 0x7F, 0x9B, 0x8E, 0xE7, 0xEB, 0x4A, 0x7C, 0x0F, 0x9E,
+        0x16, 0x2B, 0xCE, 0x33, 0x57, 0x6B, 0x31, 0x5E, 0xCE, 0xCB, 0xB6, 0x40, 0x68, 0x37, 0xBF,
+        0x51, 0xF5,
+    ];
+
+    /// Réponse à authenticatorClientPIN pour une clé à NIP (`None` : clé perdue).
+    fn client_pin_reply(command: &[u8]) -> Option<Vec<u8>> {
+        // {1: protocole, 2: sous-commande, …}
+        match command.get(5) {
+            // getKeyAgreement : {1: COSE_Key EC2 P-256}
+            Some(0x02) => Some(
+                [
+                    &[
+                        0x00, 0xA1, 0x01, 0xA5, 0x01, 0x02, 0x03, 0x38, 0x18, 0x20, 0x01, 0x21,
+                        0x58, 0x20,
+                    ][..],
+                    &P256_GX,
+                    &[0x22, 0x58, 0x20],
+                    &P256_GY,
+                ]
+                .concat(),
+            ),
+            // getPinRetries : {3: 8}
+            Some(0x01) => Some(vec![0x00, 0xA1, 0x03, 0x08]),
+            // Demande du jeton NIP : la clé a quitté le champ entre-temps.
+            _ => None,
+        }
     }
 
     impl Applet {
@@ -704,8 +744,20 @@ pub(crate) mod tests {
                         return vec![0x90, 0x00];
                     }
                     let command = std::mem::take(&mut self.chained);
+                    if self.pin_then_lost && command.first() == Some(&0x06) {
+                        return match client_pin_reply(&command) {
+                            Some(reply) => [reply, vec![0x90, 0x00]].concat(),
+                            None => {
+                                self.lost = true;
+                                Vec::new()
+                            }
+                        };
+                    }
                     self.pending_out = match command.first() {
-                        // authenticatorGetInfo
+                        // authenticatorGetInfo (NIP configuré ou non)
+                        Some(0x04) if self.pin_then_lost => {
+                            [&[0x00][..], YUBIKEY_GET_INFO].concat()
+                        }
                         Some(0x04) => [&[0x00][..], &get_info_without_pin()].concat(),
                         // authenticatorGetAssertion : aucun identifiant connu.
                         Some(0x02) => vec![0x2E],
@@ -740,6 +792,7 @@ pub(crate) mod tests {
     pub async fn run_controller<S: AsyncRead + AsyncWrite + Unpin>(
         mut io: S,
         stats: std::sync::Arc<std::sync::Mutex<Stats>>,
+        pin_then_lost: bool,
     ) {
         let mut nci = Nci::new(&mut io);
         let mut applet = Applet {
@@ -747,6 +800,8 @@ pub(crate) mod tests {
             chained: Vec::new(),
             pending_out: Vec::new(),
             keepalives: 0,
+            pin_then_lost,
+            lost: false,
         };
         let mut discovering = false;
         let mut tag_shown = false;
@@ -828,6 +883,18 @@ pub(crate) mod tests {
                         }
                     };
                     nci.write_packet(&credits).await.unwrap();
+                    if applet.lost {
+                        // Retrait de la clé : désactivation RF signalée, plus de réponse.
+                        nci.write_packet(&Packet::control(
+                            MT_NTF,
+                            GID_RF,
+                            OID_RF_DEACTIVATE,
+                            vec![DEACTIVATE_DISCOVERY, 0x02],
+                        ))
+                        .await
+                        .unwrap();
+                        continue;
+                    }
                     if let Some(reply) = reply {
                         let chunks: Vec<&[u8]> =
                             reply.chunks(usize::from(SIM_MAX_PAYLOAD)).collect();
@@ -941,7 +1008,7 @@ pub(crate) mod tests {
         runtime.block_on(async {
             let (client, server) = tokio::io::duplex(4096);
             let stats = std::sync::Arc::new(std::sync::Mutex::new(Stats::default()));
-            tokio::spawn(run_controller(server, stats.clone()));
+            tokio::spawn(run_controller(server, stats.clone(), false));
 
             let mut nci = Nci::new(client);
             let activation = nci

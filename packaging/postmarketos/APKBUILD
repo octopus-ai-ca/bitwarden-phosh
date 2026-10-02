@@ -1,7 +1,7 @@
 # Contributor: Octopus AI <334834969+octopus-ai-ca@users.noreply.github.com>
 # Maintainer: Octopus AI <334834969+octopus-ai-ca@users.noreply.github.com>
 pkgname=coffre
-pkgver=0.4.0
+pkgver=0.5.0
 pkgrel=0
 pkgdesc="Client Bitwarden adaptatif pour Phosh (GTK4/libadwaita)"
 url="https://github.com/octopus-ai-ca/bitwarden-phosh"
@@ -10,7 +10,7 @@ arch="aarch64 x86_64"
 license="GPL-3.0-only"
 # Certificats racines lus par rustls-platform-verifier (appels HTTPS du SDK) ;
 # règles udev donnant à l'utilisateur connecté l'accès aux clés FIDO2 USB (hidraw).
-depends="ca-certificates-bundle libfido2-udev"
+depends="ca-certificates-bundle libfido2-udev librsvg"
 makedepends="
 	cargo
 	cargo-auditable
@@ -47,8 +47,10 @@ package() {
 		"$pkgdir"/usr/share/applications/ca.octopusai.Coffre.desktop
 	install -Dm644 data/ca.octopusai.Coffre.metainfo.xml \
 		"$pkgdir"/usr/share/metainfo/ca.octopusai.Coffre.metainfo.xml
-	install -Dm644 data/icons/hicolor/scalable/apps/ca.octopusai.Coffre.svg \
-		"$pkgdir"/usr/share/icons/hicolor/scalable/apps/ca.octopusai.Coffre.svg
+	for size in 16 32 48 64 128 256; do
+		install -Dm644 data/icons/hicolor/${size}x$size/apps/ca.octopusai.Coffre.png \
+			"$pkgdir"/usr/share/icons/hicolor/${size}x$size/apps/ca.octopusai.Coffre.png
+	done
 }
 
 sha512sums="

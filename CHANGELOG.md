@@ -3,6 +3,33 @@
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et le projet
 respecte le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [0.5.0] - 2026-10-02
+
+### Ajouté
+- Nouvelle interface inspirée de l'extension Bitwarden : barre de navigation du bas
+  (Coffre, Générateur, Send, Paramètres), listes en cartes, palette bleu marine en mode
+  sombre et accent orange.
+- Logo de Coffre (écrans de connexion, de verrouillage et d'à propos, icônes PNG).
+- Coffre : bouton « + Créer », avatar du compte, recherche, filtres par dossier et par
+  type, sections Favoris et Tous les éléments avec compteurs, icônes des sites, ouverture
+  du site, copie rapide et menu ⋮ (copier, modifier, favori, archiver, supprimer).
+- Générateur : mot de passe (5 à 128 caractères, jeux de caractères, minimums), phrase
+  de passe et nom d'utilisateur, avec chiffres et symboles en couleur.
+- Send : création de Send texte (durée, nombre d'accès, mot de passe), copie du lien,
+  suppression.
+- Paramètres : sécurité du compte (NIP, délai et action d'expiration, appareils, phrase
+  d'empreinte, liens 2FA et mot de passe maître), options du coffre (dossiers, import
+  Bitwarden JSON ou KeePass, export JSON/CSV/JSON protégé, archive, corbeille avec
+  restauration et suppression définitive, synchronisation), apparence (thème, mode
+  compact, icônes, copie rapide), presse-papier (délai d'effacement, copie automatique
+  du TOTP), à propos et diagnostics NFC.
+- Éditeur : choix du dossier et favori.
+
+### Modifié
+- Clé de sécurité : si la clé quitte le champ NFC après la saisie de son NIP, Coffre
+  réessaie chaque seconde pendant 5 secondes sans redemander le NIP. Un NIP refusé n'est
+  jamais réessayé, pour préserver les essais de la clé.
+
 ## [0.4.0] - 2026-09-30
 
 ### Ajouté

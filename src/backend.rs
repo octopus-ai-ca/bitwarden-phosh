@@ -10,6 +10,10 @@
 //! - `account.json` : serveur, courriel et clés *protégées* nécessaires au
 //!   déverrouillage hors ligne.
 
+mod ops;
+
+pub use ops::*;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -35,8 +39,8 @@ use bitwarden_state::{
     repository::{RepositoryItem, RepositoryMigrationStep, RepositoryMigrations},
 };
 use bitwarden_vault::{
-    Cipher, CipherId, CipherListView, CipherRepromptType, CipherType, CipherView, Folder,
-    LoginUriView, LoginView, PasswordHistoryView, SecureNoteType, SecureNoteView, VaultClientExt,
+    Cipher, CipherId, CipherRepromptType, CipherType, CipherView, Folder, LoginUriView, LoginView,
+    PasswordHistoryView, SecureNoteType, SecureNoteView, VaultClientExt,
 };
 
 /// Version des clients officiels dont le SDK utilisé reproduit le comportement ;
@@ -75,6 +79,20 @@ pub enum Server {
 }
 
 impl Server {
+    /// Nom affiché : domaine du serveur.
+    pub fn label(&self) -> String {
+        match self {
+            Self::BitwardenUs => "bitwarden.com".into(),
+            Self::BitwardenEu => "bitwarden.eu".into(),
+            Self::SelfHosted(url) => url
+                .trim()
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .trim_end_matches('/')
+                .to_owned(),
+        }
+    }
+
     /// Retourne `(api_url, identity_url)`.
     fn urls(&self) -> Result<(String, String), Error> {
         match self {
@@ -124,6 +142,10 @@ pub enum Error {
     EmptyName,
     #[error("Vous n'avez pas le droit de modifier cet élément.")]
     ReadOnly,
+    #[error("Fichier illisible ou d'un format inattendu.")]
+    Malformed,
+    #[error("Ce fichier est chiffré : exportez-le sans chiffrement pour l'importer.")]
+    EncryptedImport,
     #[error("Échec de la connexion : {0}")]
     Login(String),
     #[error("Échec de l'envoi du courriel : {0}")]
@@ -226,6 +248,9 @@ pub struct ItemDraft {
     pub uri: String,
     pub totp: String,
     pub notes: String,
+    /// Dossier (`None` : aucun dossier).
+    pub folder_id: Option<String>,
+    pub favorite: bool,
 }
 
 fn non_empty(value: &str) -> Option<String> {
@@ -247,6 +272,8 @@ impl ItemDraft {
                 .unwrap_or_default(),
             totp: login.and_then(|l| l.totp.clone()).unwrap_or_default(),
             notes: view.notes.clone().unwrap_or_default(),
+            folder_id: view.folder_id.map(|id| id.to_string()),
+            favorite: view.favorite,
         }
     }
 
@@ -307,6 +334,8 @@ struct Account {
     master_password_unlock: MasterPasswordUnlockData,
     account_state: WrappedAccountCryptographicState,
     org_keys: HashMap<OrganizationId, UnsignedSharedKey>,
+    #[serde(default)]
+    last_sync: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 struct PinState {
@@ -330,6 +359,7 @@ fn migrations() -> RepositoryMigrations {
         Add(SettingItem::data()),
         Add(OrganizationSharedKey::data()),
         Add(LocalUserDataKeyState::data()),
+        Add(bitwarden_send::Send::data()),
     ])
 }
 
@@ -664,6 +694,38 @@ impl Session {
             .as_ref()
             .is_none_or(|a| a.org_keys.len() != org_keys.len());
 
+        // Dossiers et Send, chiffrés, pour les listes et le mode hors ligne.
+        let folders: Vec<_> = sync
+            .folders
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|f| Folder::try_from(f).ok())
+            .filter_map(|f| Some((f.id?, f)))
+            .collect();
+        self.client
+            .platform()
+            .state()
+            .get::<Folder>()
+            .map_err(storage)?
+            .replace_all(folders)
+            .await
+            .map_err(storage)?;
+        let sends: Vec<_> = sync
+            .sends
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|s| bitwarden_send::Send::try_from(s).ok())
+            .filter_map(|s| Some((s.id?, s)))
+            .collect();
+        self.client
+            .platform()
+            .state()
+            .get::<bitwarden_send::Send>()
+            .map_err(storage)?
+            .replace_all(sends)
+            .await
+            .map_err(storage)?;
+
         let account = Account {
             server: self.server.clone(),
             email: self.email.clone(),
@@ -672,6 +734,7 @@ impl Session {
             master_password_unlock,
             account_state,
             org_keys,
+            last_sync: Some(chrono::Utc::now()),
         };
         save_account(&account)?;
         self.account = Some(Arc::new(account));
@@ -840,29 +903,10 @@ impl Session {
             .map_err(storage)
     }
 
-    /// Liste déchiffrée (hors corbeille) des éléments, triée par nom.
-    pub async fn list(&self) -> Result<Vec<CipherListView>, Error> {
-        let ciphers = self
-            .stored_ciphers()
-            .await?
-            .into_iter()
-            .filter(|c| c.deleted_date.is_none())
-            .collect();
-        let result = self
-            .client
-            .vault()
-            .ciphers()
-            .decrypt_list_with_failures(ciphers)
-            .await;
-        if !result.failures.is_empty() {
-            eprintln!(
-                "{} élément(s) impossibles à déchiffrer",
-                result.failures.len()
-            );
-        }
-        let mut items = result.successes;
-        items.sort_by_key(|item| item.name.to_lowercase());
-        Ok(items)
+    /// Liste déchiffrée du coffre (hors corbeille et archive), triée par nom.
+    #[cfg(test)]
+    pub async fn list(&self) -> Result<Vec<bitwarden_vault::CipherListView>, Error> {
+        self.list_scope(Scope::Vault).await
     }
 
     fn parse_id(id: &str) -> Result<CipherId, Error> {
@@ -928,7 +972,12 @@ impl Session {
             partial: false,
             id: None,
             organization_id: None,
-            folder_id: None,
+            folder_id: draft
+                .folder_id
+                .as_deref()
+                .map(str::parse)
+                .transpose()
+                .map_err(|_| Error::ItemNotFound)?,
             collection_ids: vec![],
             key: None,
             name,
@@ -942,7 +991,7 @@ impl Session {
             bank_account: None,
             drivers_license: None,
             passport: None,
-            favorite: false,
+            favorite: draft.favorite,
             reprompt: CipherRepromptType::None,
             organization_use_totp: false,
             edit: true,
@@ -971,6 +1020,13 @@ impl Session {
         }
         view.name = name;
         view.notes = non_empty(&draft.notes);
+        view.favorite = draft.favorite;
+        view.folder_id = draft
+            .folder_id
+            .as_deref()
+            .map(str::parse)
+            .transpose()
+            .map_err(|_| Error::ItemNotFound)?;
         if let Some(login) = view.login.take() {
             let old_password = login.password.clone();
             let login = draft.apply_login(login);
@@ -1106,6 +1162,7 @@ mod tests {
             uri: "https://exemple.ca".into(),
             totp: String::new(),
             notes: String::new(),
+            ..Default::default()
         };
         let login = draft.apply_login(empty_login());
         assert_eq!(login.username.as_deref(), Some("moi@exemple.ca"));
@@ -1190,6 +1247,7 @@ mod tests {
                 uri: "https://exemple.ca".into(),
                 totp: "JBSWY3DPEHPK3PXP".into(),
                 notes: "note privée".into(),
+                ..Default::default()
             };
             session
                 .create_item(ItemKind::Login, draft.clone())
@@ -1295,6 +1353,294 @@ mod tests {
             assert!(Session::restore(device).await.is_none());
             eprintln!("parcours complet réussi pour {email}");
         });
+    }
+
+    /// Opérations du coffre contre un Vaultwarden local : dossiers, favoris,
+    /// archive, corbeille, export, import, Send, appareils, générateurs.
+    /// `COFFRE_E2E_SERVER=http://localhost:8000 cargo test e2e_operations -- --ignored`
+    /// (`COFFRE_E2E_KEEP=1` garde le compte, rempli de données de démonstration).
+    #[test]
+    #[ignore]
+    fn e2e_operations_vaultwarden() {
+        use super::ops::{ExportKind, ImportKind, PasswordOptions, Scope, SendDraft};
+
+        let Ok(server_url) = std::env::var("COFFRE_E2E_SERVER") else {
+            eprintln!("COFFRE_E2E_SERVER non défini : test ignoré");
+            return;
+        };
+        let server = Server::SelfHosted(server_url.clone());
+        let email = format!("ops-{}@exemple.ca", uuid::Uuid::new_v4().simple());
+        let password = "Mot de passe maître très long 123!".to_owned();
+        let device = "11111111-2222-4333-8444-666666666666";
+
+        crate::runtime().block_on(async {
+            register_account(&server_url, &email, &password).await;
+            let mut session = Session::create(&server, device, &email).await.unwrap();
+            session.login(password.clone(), None).await.unwrap();
+            session.sync().await.unwrap();
+            session.unlock(password.clone()).await.unwrap();
+            assert!(session.last_sync().is_some());
+
+            // Dossiers.
+            session.create_folder("Travail").await.unwrap();
+            session.create_folder("Perso").await.unwrap();
+            let folders = session.folders().await.unwrap();
+            assert_eq!(
+                folders.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+                ["Perso", "Travail"]
+            );
+            let work = folders[1].id.clone();
+            session
+                .rename_folder(&folders[0].id, "Personnel")
+                .await
+                .unwrap();
+            assert_eq!(session.folders().await.unwrap()[0].name, "Personnel");
+
+            // Élément dans un dossier, en favori dès la création.
+            session
+                .create_item(
+                    ItemKind::Login,
+                    ItemDraft {
+                        name: "GitHub".into(),
+                        username: "octo".into(),
+                        password: "gh-secret".into(),
+                        uri: "https://github.com".into(),
+                        folder_id: Some(work.clone()),
+                        favorite: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            session
+                .create_item(
+                    ItemKind::SecureNote,
+                    ItemDraft {
+                        name: "Codes Wi-Fi".into(),
+                        notes: "maison : 1234".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let items = session.list_scope(Scope::Vault).await.unwrap();
+            let github = items.iter().find(|i| i.name == "GitHub").unwrap();
+            assert!(github.favorite);
+            assert_eq!(github.folder_id.map(|f| f.to_string()), Some(work.clone()));
+            let github_id = github.id.unwrap().to_string();
+            let note_id = items
+                .iter()
+                .find(|i| i.name == "Codes Wi-Fi")
+                .unwrap()
+                .id
+                .unwrap()
+                .to_string();
+
+            // Favori retiré puis remis.
+            session.set_favorite(&github_id, false).await.unwrap();
+            assert!(!session.get(&github_id).await.unwrap().favorite);
+            session.set_favorite(&github_id, true).await.unwrap();
+
+            // Archive : retiré du coffre, puis désarchivé.
+            session.set_archived(&note_id, true).await.unwrap();
+            assert_eq!(session.list_scope(Scope::Vault).await.unwrap().len(), 1);
+            assert_eq!(session.list_scope(Scope::Archive).await.unwrap().len(), 1);
+            session.set_archived(&note_id, false).await.unwrap();
+            assert!(session.list_scope(Scope::Archive).await.unwrap().is_empty());
+
+            // Corbeille : restauration, puis suppression définitive.
+            session.trash(&note_id).await.unwrap();
+            session.sync().await.unwrap();
+            assert_eq!(session.list_scope(Scope::Trash).await.unwrap().len(), 1);
+            session.restore_item(&note_id).await.unwrap();
+            session.sync().await.unwrap();
+            assert!(session.list_scope(Scope::Trash).await.unwrap().is_empty());
+            session.trash(&note_id).await.unwrap();
+            session.delete_permanently(&note_id).await.unwrap();
+            session.sync().await.unwrap();
+            assert!(session.list_scope(Scope::Trash).await.unwrap().is_empty());
+            assert_eq!(session.list_scope(Scope::Vault).await.unwrap().len(), 1);
+
+            // Suppression d'un dossier : l'élément reste, sans dossier.
+            session.delete_folder(&work).await.unwrap();
+            assert_eq!(session.folders().await.unwrap().len(), 1);
+            let github = session.get(&github_id).await.unwrap();
+            assert!(github.folder_id.is_none());
+
+            // Export : mot de passe maître vérifié, JSON lisible et réimportable.
+            assert!(session.verify_master_password("mauvais").await.is_err());
+            session.verify_master_password(&password).await.unwrap();
+            let json = session.export(ExportKind::Json, None).await.unwrap();
+            assert!(json.contains("gh-secret"));
+            let csv = session.export(ExportKind::Csv, None).await.unwrap();
+            assert!(csv.contains("GitHub"));
+            let protected = session
+                .export(ExportKind::EncryptedJson, Some("fichier".into()))
+                .await
+                .unwrap();
+            assert!(!protected.contains("gh-secret"));
+            assert!(matches!(
+                session
+                    .import(
+                        ImportKind::BitwardenJson,
+                        protected.into_bytes(),
+                        None,
+                        None
+                    )
+                    .await,
+                Err(Error::EncryptedImport)
+            ));
+            let count = session
+                .import(ImportKind::BitwardenJson, json.into_bytes(), None, None)
+                .await
+                .unwrap();
+            assert_eq!(count.items, 1);
+            assert_eq!(session.list_scope(Scope::Vault).await.unwrap().len(), 2);
+
+            // Send texte : lien, liste, suppression.
+            let url = session
+                .create_send(SendDraft {
+                    name: "Adresse".into(),
+                    text: "123, rue Principale".into(),
+                    days: 7,
+                    max_access_count: Some(3),
+                    password: None,
+                    hide_text: false,
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(url.contains("/#/send/"));
+            session.sync().await.unwrap();
+            let sends = session.sends().await.unwrap();
+            assert_eq!(sends.len(), 1);
+            assert_eq!(sends[0].max_access_count, Some(3));
+            session.delete_send(&sends[0].id).await.unwrap();
+            session.sync().await.unwrap();
+            assert!(session.sends().await.unwrap().is_empty());
+
+            // Compte : appareils, phrase d'empreinte, générateurs.
+            assert!(!session.devices().await.unwrap().is_empty());
+            assert_eq!(session.fingerprint_phrase().unwrap().split('-').count(), 5);
+            let generated = session
+                .generate_with(&PasswordOptions {
+                    length: 32,
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(generated.chars().count(), 32);
+
+            if std::env::var_os("COFFRE_E2E_KEEP").is_some() {
+                seed_demo(&mut session).await;
+                eprintln!("compte conservé : {email}");
+                return;
+            }
+            session.logout();
+            eprintln!("opérations réussies pour {email}");
+        });
+    }
+
+    /// Données de démonstration (captures d'écran).
+    async fn seed_demo(session: &mut Session) {
+        use super::ops::SendDraft;
+        session.create_folder("Banque").await.unwrap();
+        session.create_folder("Travail").await.unwrap();
+        let folders = session.folders().await.unwrap();
+        let folder = |name: &str| {
+            folders
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| f.id.clone())
+        };
+        let logins = [
+            (
+                "Banque Nationale",
+                "client@exemple.ca",
+                "https://www.bnc.ca",
+                Some("Banque"),
+                true,
+            ),
+            (
+                "Desjardins",
+                "mgordon",
+                "https://www.desjardins.com",
+                Some("Banque"),
+                true,
+            ),
+            (
+                "Hydro-Québec",
+                "mgordon@exemple.ca",
+                "https://www.hydroquebec.com",
+                None,
+                false,
+            ),
+            (
+                "Amazon",
+                "mgordon@exemple.ca",
+                "https://www.amazon.ca",
+                None,
+                false,
+            ),
+            (
+                "Proton Mail",
+                "mgordon@proton.me",
+                "https://proton.me",
+                Some("Travail"),
+                false,
+            ),
+            (
+                "Wikipédia",
+                "MGordon",
+                "https://fr.wikipedia.org",
+                None,
+                false,
+            ),
+        ];
+        for (name, username, uri, dir, favorite) in logins {
+            session
+                .create_item(
+                    ItemKind::Login,
+                    ItemDraft {
+                        name: name.into(),
+                        username: username.into(),
+                        password: session.generate_password().unwrap(),
+                        uri: uri.into(),
+                        totp: if favorite {
+                            "JBSWY3DPEHPK3PXP".into()
+                        } else {
+                            String::new()
+                        },
+                        folder_id: dir.and_then(folder),
+                        favorite,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        session
+            .create_item(
+                ItemKind::SecureNote,
+                ItemDraft {
+                    name: "Codes Wi-Fi".into(),
+                    notes: "Maison : 1234-5678".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        session
+            .create_send(SendDraft {
+                name: "Adresse du chalet".into(),
+                text: "123, chemin du Lac".into(),
+                days: 7,
+                max_access_count: Some(5),
+                password: None,
+                hide_text: false,
+            })
+            .await
+            .unwrap();
+        session.sync().await.unwrap();
     }
 
     /// Crée un compte sur le serveur de test (clés générées par le SDK).

@@ -54,10 +54,10 @@ pub fn login_page(app: &App, config: &Config) -> adw::NavigationPage {
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 18);
     let status = adw::StatusPage::builder()
-        .icon_name("dialog-password-symbolic")
         .title("Coffre")
         .description("Connectez-vous à votre compte Bitwarden")
         .build();
+    status.set_paintable(super::style::logo_texture().as_ref());
     status.add_css_class("compact");
     content.append(&status);
     content.append(&server_group);
@@ -152,10 +152,10 @@ pub fn lock_page(app: &App) -> adw::NavigationPage {
     ));
 
     let status = adw::StatusPage::builder()
-        .icon_name("system-lock-screen-symbolic")
         .title("Coffre verrouillé")
         .description(glib_escape(&email))
         .build();
+    status.set_paintable(super::style::logo_texture().as_ref());
     status.add_css_class("compact");
 
     let secret_row = adw::PasswordEntryRow::new();
@@ -241,9 +241,10 @@ pub fn lock_page(app: &App) -> adw::NavigationPage {
 }
 
 /// Dialogue de définition du NIP (4 à 12 chiffres, saisi deux fois).
-pub fn set_pin_dialog(app: &App) {
+/// `done(true)` si le NIP a été défini.
+pub fn set_pin_dialog(app: &App, done: impl Fn(bool) + 'static) {
     let Some(session) = app.session() else {
-        return;
+        return done(false);
     };
     let pin_row = adw::PasswordEntryRow::builder()
         .title("NIP")
@@ -276,22 +277,28 @@ pub fn set_pin_dialog(app: &App) {
     dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
 
     let app_ = app.clone();
-    dialog.connect_response(Some("save"), move |_, _| {
+    dialog.connect_response(None, move |_, response| {
+        if response != "save" {
+            return done(false);
+        }
         let pin = pin_row.text().to_string();
         if pin.len() < 4 || pin.len() > 12 || !pin.chars().all(|c| c.is_ascii_digit()) {
             app_.toast("Le NIP doit compter de 4 à 12 chiffres.");
-            return;
+            return done(false);
         }
         if pin != confirm_row.text().as_str() {
             app_.toast("Les deux NIP ne correspondent pas.");
-            return;
+            return done(false);
         }
         match session.set_pin(pin) {
             Ok(()) => {
                 app_.toast("NIP défini");
-                app_.show_vault();
+                done(true);
             }
-            Err(e) => app_.toast(&e.to_string()),
+            Err(e) => {
+                app_.toast(&e.to_string());
+                done(false);
+            }
         }
     });
     dialog.present(Some(&app.window));
